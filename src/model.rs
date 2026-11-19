@@ -5,6 +5,7 @@
 //! template substitution anywhere in Kolibri.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
@@ -143,6 +144,13 @@ fn walk_mut(folders: &mut [Folder], f: &mut impl FnMut(&mut Folder)) {
         f(folder);
         walk_mut(&mut folder.folders, f);
     }
+}
+
+/// Result of [`Store::search`]: ids of the folders and requests to show.
+#[derive(Default, Debug)]
+pub struct SearchHits {
+    pub folders: HashSet<u64>,
+    pub requests: HashSet<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -286,6 +294,35 @@ impl Store {
             .collect()
     }
 
+    /// Folders and requests to show for a sidebar search. A request matches
+    /// on its name or URL (case-insensitive). A folder whose name matches
+    /// shows everything inside it; other folders show only to reach a match.
+    pub fn search(&self, query: &str) -> SearchHits {
+        fn visit(f: &Folder, q: &str, inside_match: bool, hits: &mut SearchHits) -> bool {
+            let all = inside_match || f.name.to_lowercase().contains(q);
+            let mut any = all;
+            for sub in &f.folders {
+                any |= visit(sub, q, all, hits);
+            }
+            for r in &f.requests {
+                if all || r.name.to_lowercase().contains(q) || r.url.to_lowercase().contains(q) {
+                    hits.requests.insert(r.id);
+                    any = true;
+                }
+            }
+            if any {
+                hits.folders.insert(f.id);
+            }
+            any
+        }
+        let q = query.trim().to_lowercase();
+        let mut hits = SearchHits::default();
+        for f in &self.folders {
+            visit(f, &q, false, &mut hits);
+        }
+        hits
+    }
+
     /// Collapse every folder at every depth.
     pub fn collapse_all(&mut self) {
         walk_mut(&mut self.folders, &mut |f| f.expanded = false);
@@ -302,7 +339,7 @@ impl Store {
         });
         let mut next = self.next_id.max(max);
         // Pass 2: re-number zero and repeated ids.
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut fix = |id: &mut u64| {
             if *id == 0 || !seen.insert(*id) {
                 next += 1;
@@ -474,6 +511,46 @@ mod tests {
         let (parent, index, f) = s.take_folder(3).unwrap();
         assert_eq!((parent, index, f.id), (Some(1), 0, 3));
         assert!(s.find_request(4).is_none());
+    }
+
+    #[test]
+    fn search_matches_name_or_url_and_keeps_parents() {
+        let req = |id, name: &str, url: &str| Request {
+            id,
+            name: name.into(),
+            url: url.into(),
+            ..Default::default()
+        };
+        let mut s = Store::default();
+        s.folders.push(Folder {
+            id: 1,
+            name: "Shop".into(),
+            requests: vec![req(2, "List orders", "https://x/orders")],
+            folders: vec![Folder {
+                id: 3,
+                name: "Users".into(),
+                requests: vec![req(4, "Get one", "https://x/users/1")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        s.folders.push(Folder { id: 5, name: "Other".into(), ..Default::default() });
+
+        // By name, case-insensitive; parents stay visible, others don't.
+        let h = s.search("ORDERS");
+        assert_eq!(h.requests, HashSet::from([2]));
+        assert_eq!(h.folders, HashSet::from([1]));
+
+        // By URL, through a subfolder.
+        let h = s.search(" /users/ ");
+        assert_eq!(h.requests, HashSet::from([4]));
+        assert_eq!(h.folders, HashSet::from([1, 3]));
+
+        // A matching folder shows all of its contents.
+        let h = s.search("users");
+        assert!(h.requests.contains(&4) && h.folders.contains(&3));
+
+        assert!(s.search("nothing-like-this").folders.is_empty());
     }
 
     #[test]

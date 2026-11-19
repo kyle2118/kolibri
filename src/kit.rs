@@ -25,6 +25,8 @@ pub enum Icon {
     Import,
     /// Two chevrons pointing at a line between them.
     CollapseAll,
+    /// Magnifying glass.
+    Search,
     Send,
     Copy,
     Close,
@@ -98,6 +100,10 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[(5.0, 2.0), (8.0, 4.8), (11.0, 2.0)]);
             line(&[(2.5, 8.0), (13.5, 8.0)]);
             line(&[(5.0, 14.0), (8.0, 11.2), (11.0, 14.0)]);
+        }
+        Icon::Search => {
+            p.circle_stroke(pt(7.0, 7.0), 4.5 * s, st);
+            line(&[(10.4, 10.4), (13.8, 13.8)]);
         }
         Icon::Send => {
             closed(&[(2.5, 7.6), (13.8, 2.6), (9.4, 13.6), (7.6, 9.0)]);

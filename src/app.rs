@@ -4,7 +4,7 @@ use crate::http::{self, HttpResult};
 use crate::kit::{self, seg, Icon};
 use crate::loadtest;
 use crate::postman;
-use crate::model::{self, BodyKind, Folder, KeyValue, Method, Request, Store};
+use crate::model::{self, BodyKind, Folder, KeyValue, Method, Request, SearchHits, Store};
 use crate::theme::{self, font, mix, radius, size, space, Palette};
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Galley, Id, Key,
@@ -111,6 +111,8 @@ pub struct App {
     req_tab: ReqTab,
     resp_tab: RespTab,
     rename: Option<Rename>,
+    /// Sidebar search text (not saved).
+    search: String,
     drag: Option<Item>,
     confirm_delete: Option<Item>,
     beautify_err: Option<String>,
@@ -204,6 +206,7 @@ impl App {
             req_tab: ReqTab::Params,
             resp_tab: RespTab::Body,
             rename: None,
+            search: String::new(),
             drag: None,
             confirm_delete: None,
             beautify_err: None,
@@ -569,12 +572,29 @@ impl App {
             }
         });
         ui.add_space(space::XS);
+        if self.store.folders.is_empty() {
+            self.search.clear();
+        } else {
+            self.search_field(ui);
+            ui.add_space(space::SM);
+        }
+
+        let hits = (!self.search.trim().is_empty()).then(|| self.store.search(&self.search));
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
-                if self.store.folders.is_empty() {
+                if hits.as_ref().is_some_and(|h| h.folders.is_empty()) {
+                    ui.add_space(space::XL);
+                    kit::empty_state(
+                        ui,
+                        Icon::Search,
+                        "No matches",
+                        "Nothing matches that name or URL.",
+                        &[],
+                    );
+                } else if self.store.folders.is_empty() {
                     ui.add_space(space::XL);
                     kit::empty_state(
                         ui,
@@ -596,7 +616,7 @@ impl App {
                 let mut path = Vec::new();
                 for fi in 0..self.store.folders.len() {
                     path.push(fi);
-                    self.folder_tree(ui, &mut path, None, &mut out);
+                    self.folder_tree(ui, &mut path, None, hits.as_ref(), &mut out);
                     path.pop();
                 }
                 ui.add_space(40.0);
@@ -613,13 +633,70 @@ impl App {
         self.handle_drag(ui, &out.rows);
     }
 
+    /// Search box above the tree. ⌘F / Ctrl+F focuses it, Esc clears it.
+    fn search_field(&mut self, ui: &mut Ui) {
+        let p = theme::palette(ui);
+        let id = Id::unique("kolibri-sidebar-search");
+        if ui.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::F)))
+        {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        let (rect, _) =
+            ui.allocate_exact_size(vec2(ui.available_width(), size::CONTROL), Sense::hover());
+        let focused = ui.memory(|m| m.has_focus(id));
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(radius::MD),
+            p.bg_surface,
+            Stroke::new(1.0, if focused { p.accent } else { p.border }),
+            StrokeKind::Inside,
+        );
+        kit::paint_icon(
+            ui.painter(),
+            Rect::from_center_size(pos2(rect.left() + 14.0, rect.center().y), vec2(13.0, 13.0)),
+            Icon::Search,
+            p.text_faint,
+        );
+        let clear_w = if self.search.is_empty() { 0.0 } else { 26.0 };
+        let field = Rect::from_min_max(
+            pos2(rect.left() + 26.0, rect.top()),
+            pos2(rect.right() - 4.0 - clear_w, rect.bottom()),
+        );
+        let te = ui.put(
+            field,
+            TextEdit::singleline(&mut self.search)
+                .id(id)
+                .frame(Frame::NONE)
+                .hint_text(format!("Search name or URL  {}", shortcut("F")))
+                .font(font::body())
+                .desired_width(f32::INFINITY)
+                .min_size(field.size())
+                .align(Align2::LEFT_CENTER),
+        );
+        if (te.has_focus() || te.lost_focus()) && ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.search.clear();
+        }
+        if !self.search.is_empty() {
+            let r = Rect::from_center_size(
+                pos2(rect.right() - 4.0 - clear_w / 2.0, rect.center().y),
+                vec2(20.0, 20.0),
+            );
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
+            if kit::icon_button_sized(&mut child, Icon::Close, "Clear search", 20.0).clicked() {
+                self.search.clear();
+            }
+        }
+    }
+
     /// Draw the folder at `path` (child indexes from the top level), then,
-    /// if it is open, its subfolders and requests.
+    /// if it is open, its subfolders and requests. With `hits`, only search
+    /// matches (and the folders leading to them) are drawn, all opened.
     fn folder_tree(
         &mut self,
         ui: &mut Ui,
         path: &mut Vec<usize>,
         parent: Option<u64>,
+        hits: Option<&SearchHits>,
         out: &mut TreeOut,
     ) {
         let p = theme::palette(ui);
@@ -629,6 +706,10 @@ impl App {
             return;
         };
         let fid = folder.id;
+        if hits.is_some_and(|h| !h.folders.contains(&fid)) {
+            return;
+        }
+        let expanded = folder.expanded || hits.is_some();
         let row = RowRef::Folder { id: fid, parent, index };
 
         let renaming = matches!(&self.rename, Some(r) if r.item == Item::Folder(fid));
@@ -639,7 +720,7 @@ impl App {
             out.rows.push((rect, row));
         } else {
             let dragging_this = self.drag == Some(Item::Folder(fid));
-            let resp = folder_row(ui, folder, indent, dragging_this);
+            let resp = folder_row(ui, folder, expanded, indent, dragging_this);
             out.rows.push((resp.rect, row));
             if resp.clicked() {
                 let (plus, sub) = folder_row_buttons(resp.rect);
@@ -680,17 +761,17 @@ impl App {
         }
 
         let folder = self.store.folder_at(path).unwrap();
-        if !folder.expanded {
+        if !expanded {
             return;
         }
         for i in 0..folder.folders.len() {
             path.push(i);
-            self.folder_tree(ui, path, Some(fid), out);
+            self.folder_tree(ui, path, Some(fid), hits, out);
             path.pop();
         }
 
         let folder = self.store.folder_at(path).unwrap();
-        if folder.requests.is_empty() && folder.folders.is_empty() {
+        if hits.is_none() && folder.requests.is_empty() && folder.folders.is_empty() {
             let (rect, _) =
                 ui.allocate_exact_size(vec2(ui.available_width(), size::ROW), Sense::hover());
             ui.painter().text(
@@ -704,6 +785,9 @@ impl App {
         for ri in 0..folder.requests.len() {
             let req = &self.store.folder_at(path).unwrap().requests[ri];
             let rid = req.id;
+            if hits.is_some_and(|h| !h.requests.contains(&rid)) {
+                continue;
+            }
             let row = RowRef::Request { folder: fid, index: ri };
             let renaming = matches!(&self.rename, Some(r) if r.item == Item::Request(rid));
             if renaming {
@@ -1642,7 +1726,13 @@ fn folder_row_buttons(rect: Rect) -> (Rect, Rect) {
     (plus, sub)
 }
 
-fn folder_row(ui: &mut Ui, folder: &Folder, indent: f32, dragging: bool) -> egui::Response {
+fn folder_row(
+    ui: &mut Ui,
+    folder: &Folder,
+    expanded: bool,
+    indent: f32,
+    dragging: bool,
+) -> egui::Response {
     let p = theme::palette(ui);
     let (rect, resp) = ui.allocate_exact_size(
         vec2(ui.available_width(), size::ROW),
@@ -1653,7 +1743,7 @@ fn folder_row(ui: &mut Ui, folder: &Folder, indent: f32, dragging: bool) -> egui
     let painter = ui.painter();
     let cy = rect.center().y;
     let left = rect.left() + indent;
-    let chevron = if folder.expanded {
+    let chevron = if expanded {
         Icon::ChevronDown
     } else {
         Icon::ChevronRight

@@ -599,10 +599,28 @@ fn steps() -> Vec<Step> {
             click: Some(ClickAt::ThemeToggle),
         },
         Step {
-            name: "27-empty-collection",
+            // URL match inside a collapsed folder and inside a subfolder.
+            name: "27-search-by-url",
+            size: BIG,
+            light: false,
+            setup: |a, _| a.search = "health".into(),
+            ready: always,
+            click: None,
+        },
+        Step {
+            name: "28-search-no-matches",
+            size: BIG,
+            light: false,
+            setup: |a, _| a.search = "zzz".into(),
+            ready: always,
+            click: None,
+        },
+        Step {
+            name: "29-empty-collection",
             size: BIG,
             light: false,
             setup: |a, _| {
+                a.search.clear();
                 a.store.folders.clear();
                 a.store.selected = None
             },

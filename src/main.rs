@@ -4,8 +4,10 @@ mod app;
 mod curl;
 mod highlight;
 mod http;
+mod kit;
 mod loadtest;
 mod model;
+mod theme;
 
 /// App icon (window, taskbar and macOS Dock), embedded in the binary.
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon-512.png");

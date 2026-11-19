@@ -51,12 +51,37 @@ rustls with the OS certificate store).
 ## Code layout
 
 - `src/main.rs` window setup
-- `src/app.rs` all UI: sidebar, drag and drop, editor, response, load test view
+- `src/theme.rs` design system: dark and light palettes, typography, spacing, sizes,
+  radii, and the global egui style built from them
+- `src/kit.rs` reusable components: vector icons, buttons, segmented tabs, badges,
+  checkboxes, menu items, cards, callouts, empty states
+- `src/app.rs` screens: sidebar, drag and drop, request editor, response, load test, dialogs
 - `src/model.rs` data model, JSON persistence, URL/params syncing
 - `src/curl.rs` parsing pasted curl commands
 - `src/http.rs` building and sending requests, JSON beautify
 - `src/loadtest.rs` load test workers and stats
 - `src/highlight.rs` small JSON syntax highlighter
+- `src/qa.rs` visual QA tour (development only, see below)
 - `assets/` app icon: `icon.png` (1024 master), `icon-512.png` (embedded window/Dock icon),
-  `kolibri.icns` (macOS bundle), `icon-source.png` (original artwork)
+  `icon-64.png` (sidebar logo), `kolibri.icns` (macOS bundle), `icon-source.png` (original artwork)
+- `assets/fonts/` Inter and JetBrains Mono (Latin, Latin Extended, Cyrillic), both under the
+  SIL Open Font License (`Inter-OFL.txt`, `JetBrainsMono-OFL.txt`)
 - `scripts/bundle-macos.sh` builds the macOS `.app` bundle
+
+## Design
+
+Colors, fonts and sizes live only in `src/theme.rs`; screens use semantic names
+(`bg_surface`, `text_muted`, `accent`, `space::MD`, `size::CONTROL`, ...) and the
+components in `src/kit.rs`. The app follows the system light/dark setting.
+
+## Visual QA
+
+A scripted screenshot tour checks every major screen in both themes and at several
+window sizes. It runs against a local mock API with demo data and never touches your
+saved requests:
+
+```sh
+KOLIBRI_DATA=/tmp/kolibri-qa.json KOLIBRI_SHOTS=/tmp/kolibri-shots cargo run --features qa
+```
+
+PNG screenshots are written to the `KOLIBRI_SHOTS` folder, then the app quits.

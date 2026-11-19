@@ -1,6 +1,6 @@
 //! Tiny, tolerant JSON syntax highlighter producing an egui LayoutJob.
 
-use eframe::egui::{self, text::ByteIndex, text::LayoutJob, text::LayoutSection, Color32, FontId, TextFormat};
+use eframe::egui::{text::ByteIndex, text::LayoutJob, text::LayoutSection, Color32, FontId, TextFormat};
 
 struct Palette {
     key: Color32,
@@ -11,25 +11,16 @@ struct Palette {
     plain: Color32,
 }
 
+/// Syntax colors derived from the app palette so code matches the theme.
 fn palette(dark: bool) -> Palette {
-    if dark {
-        Palette {
-            key: Color32::from_rgb(0x9C, 0xDC, 0xFE),
-            string: Color32::from_rgb(0xCE, 0x91, 0x78),
-            number: Color32::from_rgb(0xB5, 0xCE, 0xA8),
-            keyword: Color32::from_rgb(0x56, 0x9C, 0xD6),
-            punct: Color32::from_gray(170),
-            plain: Color32::from_gray(220),
-        }
-    } else {
-        Palette {
-            key: Color32::from_rgb(0x00, 0x45, 0x9E),
-            string: Color32::from_rgb(0xA3, 0x15, 0x15),
-            number: Color32::from_rgb(0x09, 0x86, 0x58),
-            keyword: Color32::from_rgb(0x00, 0x00, 0xFF),
-            punct: Color32::from_gray(90),
-            plain: Color32::from_gray(30),
-        }
+    let t = crate::theme::palette_for(dark);
+    Palette {
+        key: t.info,
+        string: t.success,
+        number: t.warning,
+        keyword: t.purple,
+        punct: t.text_faint,
+        plain: t.text,
     }
 }
 
@@ -105,8 +96,4 @@ pub fn json_job(text: &str, font: FontId, dark: bool, highlight: bool) -> Layout
         }
     }
     job
-}
-
-pub fn mono(ui: &egui::Ui) -> FontId {
-    egui::TextStyle::Monospace.resolve(ui.style())
 }

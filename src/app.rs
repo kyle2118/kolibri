@@ -1,11 +1,14 @@
 use crate::curl;
-use crate::highlight::{json_job, mono};
+use crate::highlight::json_job;
 use crate::http::{self, HttpResult};
+use crate::kit::{self, seg, Icon};
 use crate::loadtest;
 use crate::model::{self, BodyKind, Folder, KeyValue, Method, Request, Store};
+use crate::theme::{self, font, mix, radius, size, space, Palette};
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, CursorIcon, Galley, Id, Key, KeyboardShortcut, Label,
-    Layout, Modifiers, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui,
+    self, pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Galley, Id, Key,
+    KeyboardShortcut, Label, Layout, Margin, Modifiers, Rect, RichText, ScrollArea, Sense, Stroke,
+    StrokeKind, TextEdit, Ui,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,7 +16,9 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const ROW_H: f32 = 24.0;
+#[cfg(feature = "qa")]
+#[path = "qa.rs"]
+mod qa;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Item {
@@ -93,25 +98,27 @@ pub struct App {
     confirm_delete: Option<Item>,
     beautify_err: Option<String>,
     curl_err: Option<String>,
+    logo: Option<egui::TextureHandle>,
+
+    #[cfg(feature = "qa")]
+    qa: Option<qa::Tour>,
 }
 
-pub fn method_color(m: Method) -> Color32 {
-    match m {
-        Method::GET => Color32::from_rgb(0x3F, 0xB9, 0x50),
-        Method::POST => Color32::from_rgb(0xE8, 0xA3, 0x17),
-        Method::PUT => Color32::from_rgb(0x3B, 0x8E, 0xEA),
-        Method::PATCH => Color32::from_rgb(0xA3, 0x71, 0xF7),
-        Method::DELETE => Color32::from_rgb(0xF0, 0x52, 0x52),
-        Method::HEAD | Method::OPTIONS => Color32::from_rgb(0x8B, 0x94, 0x9E),
+/// Platform-appropriate shortcut label, e.g. "⌘↵" on macOS, "Ctrl+↵" elsewhere.
+fn shortcut(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌘{key}")
+    } else {
+        format!("Ctrl+{key}")
     }
 }
 
-fn status_color(code: u16) -> Color32 {
-    match code {
-        200..=299 => Color32::from_rgb(0x3F, 0xB9, 0x50),
-        300..=399 => Color32::from_rgb(0x3B, 0x8E, 0xEA),
-        400..=499 => Color32::from_rgb(0xE8, 0xA3, 0x17),
-        _ => Color32::from_rgb(0xF0, 0x52, 0x52),
+/// Short method label for the narrow sidebar column.
+fn method_short(m: Method) -> &'static str {
+    match m {
+        Method::DELETE => "DEL",
+        Method::OPTIONS => "OPT",
+        other => other.as_str(),
     }
 }
 
@@ -136,15 +143,31 @@ fn fmt_dur(d: Duration) -> String {
     }
 }
 
+fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-64.png")).ok()?;
+    let img = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    Some(ctx.load_texture("kolibri-logo", img, egui::TextureOptions::LINEAR))
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut style = (*cc.egui_ctx.global_style()).clone();
-        style.spacing.item_spacing = vec2(8.0, 6.0);
-        style.spacing.button_padding = vec2(8.0, 4.0);
-        cc.egui_ctx.set_global_style(style);
-
+        theme::install(&cc.egui_ctx);
         let path = model::data_path();
         let (store, notice) = model::load(&path);
+        #[allow(unused_mut)]
+        let mut app = Self::with_store(store, path, notice);
+        app.logo = load_logo(&cc.egui_ctx);
+        #[cfg(feature = "qa")]
+        {
+            app.qa = qa::Tour::from_env(&mut app);
+        }
+        app
+    }
+
+    fn with_store(store: Store, path: PathBuf, notice: Option<String>) -> Self {
         Self {
             store,
             path,
@@ -164,6 +187,9 @@ impl App {
             confirm_delete: None,
             beautify_err: None,
             curl_err: None,
+            logo: None,
+            #[cfg(feature = "qa")]
+            qa: None,
         }
     }
 
@@ -185,7 +211,9 @@ impl App {
     // ------------------------------------------------------------------ sending
 
     fn send(&mut self, ctx: &egui::Context, id: u64) {
-        let Some(req) = self.store.find_request(id).cloned() else { return };
+        let Some(req) = self.store.find_request(id).cloned() else {
+            return;
+        };
         let (tx, rx) = channel();
         let agent = self.agent.clone();
         let ctx = ctx.clone();
@@ -212,7 +240,13 @@ impl App {
         for (id, r) in done {
             self.inflight.remove(&id);
             let result = r.unwrap_or_else(|| Err("Request thread stopped unexpectedly".into()));
-            self.responses.insert(id, ResponseView { result, galley: None });
+            self.responses.insert(
+                id,
+                ResponseView {
+                    result,
+                    galley: None,
+                },
+            );
         }
     }
 
@@ -234,31 +268,58 @@ impl App {
             }
             Action::StartRename(item) => {
                 let text = match item {
-                    Item::Folder(id) => self.store.folder_index(id).map(|i| self.store.folders[i].name.clone()),
+                    Item::Folder(id) => self
+                        .store
+                        .folder_index(id)
+                        .map(|i| self.store.folders[i].name.clone()),
                     Item::Request(id) => self.store.find_request(id).map(|r| r.name.clone()),
                 };
                 if let Some(text) = text {
-                    self.rename = Some(Rename { item, text, focus: true });
+                    self.rename = Some(Rename {
+                        item,
+                        text,
+                        focus: true,
+                    });
                 }
             }
             Action::NewFolder => {
                 let id = self.store.new_id();
-                self.store.folders.push(Folder { id, name: "New folder".into(), ..Default::default() });
-                self.rename = Some(Rename { item: Item::Folder(id), text: "New folder".into(), focus: true });
+                self.store.folders.push(Folder {
+                    id,
+                    name: "New folder".into(),
+                    ..Default::default()
+                });
+                self.rename = Some(Rename {
+                    item: Item::Folder(id),
+                    text: "New folder".into(),
+                    focus: true,
+                });
                 self.touch();
             }
             Action::NewRequest(fid) => {
-                let Some(fi) = self.store.folder_index(fid) else { return };
+                let Some(fi) = self.store.folder_index(fid) else {
+                    return;
+                };
                 let id = self.store.new_id();
                 let f = &mut self.store.folders[fi];
                 f.expanded = true;
-                f.requests.push(Request { id, name: "New request".into(), ..Default::default() });
+                f.requests.push(Request {
+                    id,
+                    name: "New request".into(),
+                    ..Default::default()
+                });
                 self.store.selected = Some(id);
-                self.rename = Some(Rename { item: Item::Request(id), text: "New request".into(), focus: true });
+                self.rename = Some(Rename {
+                    item: Item::Request(id),
+                    text: "New request".into(),
+                    focus: true,
+                });
                 self.touch();
             }
             Action::Duplicate(rid) => {
-                let Some((fi, ri)) = self.store.locate_request(rid) else { return };
+                let Some((fi, ri)) = self.store.locate_request(rid) else {
+                    return;
+                };
                 let id = self.store.new_id();
                 let mut copy = self.store.folders[fi].requests[ri].clone();
                 copy.id = id;
@@ -323,18 +384,24 @@ impl App {
     fn apply_drop(&mut self, item: Item, target: DropTarget) {
         match (item, target) {
             (Item::Folder(id), DropTarget::FolderAt(mut to)) => {
-                let Some(from) = self.store.folder_index(id) else { return };
+                let Some(from) = self.store.folder_index(id) else {
+                    return;
+                };
                 if to > from {
                     to -= 1;
                 }
                 if to != from {
                     let f = self.store.folders.remove(from);
-                    self.store.folders.insert(to.min(self.store.folders.len()), f);
+                    self.store
+                        .folders
+                        .insert(to.min(self.store.folders.len()), f);
                     self.touch();
                 }
             }
             (Item::Request(id), DropTarget::RequestAt { folder, mut index }) => {
-                let Some((sf, si)) = self.store.locate_request(id) else { return };
+                let Some((sf, si)) = self.store.locate_request(id) else {
+                    return;
+                };
                 if sf == folder && (index == si || index == si + 1) {
                     return;
                 }
@@ -348,7 +415,9 @@ impl App {
                 self.touch();
             }
             (Item::Request(id), DropTarget::IntoFolder(folder)) => {
-                let Some((sf, si)) = self.store.locate_request(id) else { return };
+                let Some((sf, si)) = self.store.locate_request(id) else {
+                    return;
+                };
                 if sf == folder {
                     return;
                 }
@@ -365,131 +434,187 @@ impl App {
     // ------------------------------------------------------------------ sidebar
 
     fn sidebar(&mut self, ui: &mut Ui) {
+        let p = theme::palette(ui);
         let mut actions = Vec::new();
-        ui.add_space(6.0);
+
+        // Brand + primary sidebar action.
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Kolibri").strong().size(16.0));
+            ui.set_height(size::CONTROL);
+            ui.spacing_mut().item_spacing.x = space::SM;
+            if let Some(logo) = &self.logo {
+                ui.add(egui::Image::new((logo.id(), vec2(20.0, 20.0))));
+            }
+            ui.label(RichText::new("Kolibri").font(font::title()).color(p.text));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("+ Folder").on_hover_text("New folder").clicked() {
+                if kit::icon_button(ui, Icon::FolderPlus, "New folder").clicked() {
                     actions.push(Action::NewFolder);
                 }
             });
         });
-        ui.separator();
+        ui.add_space(space::MD);
+        ui.horizontal(|ui| {
+            ui.add_space(space::SM);
+            kit::overline(ui, "Collections");
+        });
+        ui.add_space(space::XS);
 
         let mut rows: Vec<(Rect, RowRef)> = Vec::new();
         let mut commit = false;
         let mut cancel = false;
 
-        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
-            if self.store.folders.is_empty() {
-                ui.add_space(20.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("No folders yet").weak());
-                    if ui.button("Create a folder").clicked() {
-                        actions.push(Action::NewFolder);
-                    }
-                });
-            }
-            for fi in 0..self.store.folders.len() {
-                let folder = &self.store.folders[fi];
-                let fid = folder.id;
-                let renaming = matches!(&self.rename, Some(r) if r.item == Item::Folder(fid));
-                if renaming {
-                    let (rect, c, x) = rename_row(ui, self.rename.as_mut().unwrap(), 4.0);
-                    commit |= c;
-                    cancel |= x;
-                    rows.push((rect, RowRef::Folder(fi)));
-                } else {
-                    let dragging_this = self.drag == Some(Item::Folder(fid));
-                    let resp = folder_row(ui, folder, dragging_this);
-                    rows.push((resp.rect, RowRef::Folder(fi)));
-                    let plus = Rect::from_min_size(
-                        pos2(resp.rect.right() - 26.0, resp.rect.top()),
-                        vec2(26.0, resp.rect.height()),
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                if self.store.folders.is_empty() {
+                    ui.add_space(space::XL);
+                    kit::empty_state(
+                        ui,
+                        Icon::Folder,
+                        "No collections",
+                        "Create a folder to organize requests.",
+                        &[],
                     );
-                    if resp.clicked() {
-                        let on_plus = resp.interact_pointer_pos().is_some_and(|p| plus.contains(p));
-                        actions.push(if on_plus { Action::NewRequest(fid) } else { Action::Toggle(fid) });
-                    }
-                    if resp.double_clicked() {
-                        actions.push(Action::StartRename(Item::Folder(fid)));
-                    }
-                    if resp.drag_started() {
-                        self.drag = Some(Item::Folder(fid));
-                    }
-                    resp.context_menu(|ui| {
-                        if ui.button("New request").clicked() {
-                            actions.push(Action::NewRequest(fid));
-                            ui.close();
-                        }
-                        if ui.button("Rename").clicked() {
-                            actions.push(Action::StartRename(Item::Folder(fid)));
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("Delete folder").clicked() {
-                            actions.push(Action::AskDelete(Item::Folder(fid)));
-                            ui.close();
+                    ui.add_space(space::MD);
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .add(kit::Button::secondary("New folder").icon(Icon::FolderPlus))
+                            .clicked()
+                        {
+                            actions.push(Action::NewFolder);
                         }
                     });
                 }
-
-                let folder = &self.store.folders[fi];
-                if !folder.expanded {
-                    continue;
-                }
-                if folder.requests.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.add_space(28.0);
-                        ui.label(RichText::new("Empty. Click + to add a request.").weak().small());
-                    });
-                }
-                for ri in 0..folder.requests.len() {
-                    let req = &self.store.folders[fi].requests[ri];
-                    let rid = req.id;
-                    let renaming = matches!(&self.rename, Some(r) if r.item == Item::Request(rid));
+                for fi in 0..self.store.folders.len() {
+                    let folder = &self.store.folders[fi];
+                    let fid = folder.id;
+                    let renaming = matches!(&self.rename, Some(r) if r.item == Item::Folder(fid));
                     if renaming {
                         let (rect, c, x) = rename_row(ui, self.rename.as_mut().unwrap(), 26.0);
                         commit |= c;
                         cancel |= x;
-                        rows.push((rect, RowRef::Request(fi, ri)));
+                        rows.push((rect, RowRef::Folder(fi)));
+                    } else {
+                        let dragging_this = self.drag == Some(Item::Folder(fid));
+                        let resp = folder_row(ui, folder, dragging_this);
+                        rows.push((resp.rect, RowRef::Folder(fi)));
+                        let plus = Rect::from_min_size(
+                            pos2(resp.rect.right() - 28.0, resp.rect.top()),
+                            vec2(28.0, resp.rect.height()),
+                        );
+                        if resp.clicked() {
+                            let on_plus = resp
+                                .interact_pointer_pos()
+                                .is_some_and(|p| plus.contains(p));
+                            actions.push(if on_plus {
+                                Action::NewRequest(fid)
+                            } else {
+                                Action::Toggle(fid)
+                            });
+                        }
+                        if resp.double_clicked() {
+                            actions.push(Action::StartRename(Item::Folder(fid)));
+                        }
+                        if resp.drag_started() {
+                            self.drag = Some(Item::Folder(fid));
+                        }
+                        resp.context_menu(|ui| {
+                            if kit::menu_item(ui, Some(Icon::Plus), "New request", false).clicked()
+                            {
+                                actions.push(Action::NewRequest(fid));
+                                ui.close();
+                            }
+                            if kit::menu_item(ui, Some(Icon::Pencil), "Rename", false).clicked() {
+                                actions.push(Action::StartRename(Item::Folder(fid)));
+                                ui.close();
+                            }
+                            kit::menu_separator(ui);
+                            if kit::menu_item(ui, Some(Icon::Trash), "Delete folder", true)
+                                .clicked()
+                            {
+                                actions.push(Action::AskDelete(Item::Folder(fid)));
+                                ui.close();
+                            }
+                        });
+                    }
+
+                    let folder = &self.store.folders[fi];
+                    if !folder.expanded {
                         continue;
                     }
-                    let selected = self.store.selected == Some(rid);
-                    let busy = self.inflight.contains_key(&rid)
-                        || self.loads.get(&rid).is_some_and(|l| l.is_running());
-                    let resp = request_row(ui, req, selected, busy, self.drag == Some(Item::Request(rid)));
-                    rows.push((resp.rect, RowRef::Request(fi, ri)));
-                    if resp.clicked() {
-                        actions.push(Action::Select(rid));
+                    if folder.requests.is_empty() {
+                        let (rect, _) = ui.allocate_exact_size(
+                            vec2(ui.available_width(), size::ROW),
+                            Sense::hover(),
+                        );
+                        ui.painter().text(
+                            pos2(rect.left() + 34.0, rect.center().y),
+                            Align2::LEFT_CENTER,
+                            "No requests yet",
+                            font::small(),
+                            p.text_faint,
+                        );
                     }
-                    if resp.double_clicked() {
-                        actions.push(Action::StartRename(Item::Request(rid)));
-                    }
-                    if resp.drag_started() {
-                        self.drag = Some(Item::Request(rid));
-                    }
-                    resp.context_menu(|ui| {
-                        if ui.button("Rename").clicked() {
+                    for ri in 0..folder.requests.len() {
+                        let req = &self.store.folders[fi].requests[ri];
+                        let rid = req.id;
+                        let renaming =
+                            matches!(&self.rename, Some(r) if r.item == Item::Request(rid));
+                        if renaming {
+                            let (rect, c, x) = rename_row(ui, self.rename.as_mut().unwrap(), 30.0);
+                            commit |= c;
+                            cancel |= x;
+                            rows.push((rect, RowRef::Request(fi, ri)));
+                            continue;
+                        }
+                        let selected = self.store.selected == Some(rid);
+                        let busy = self.inflight.contains_key(&rid)
+                            || self.loads.get(&rid).is_some_and(|l| l.is_running());
+                        let resp = request_row(
+                            ui,
+                            req,
+                            selected,
+                            busy,
+                            self.drag == Some(Item::Request(rid)),
+                        );
+                        rows.push((resp.rect, RowRef::Request(fi, ri)));
+                        #[cfg(feature = "qa")]
+                        if fi == 0 && ri == 0 {
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(Id::unique("qa_first_request_row"), resp.rect)
+                            });
+                        }
+                        if resp.clicked() {
+                            actions.push(Action::Select(rid));
+                        }
+                        if resp.double_clicked() {
                             actions.push(Action::StartRename(Item::Request(rid)));
-                            ui.close();
                         }
-                        if ui.button("Duplicate").clicked() {
-                            actions.push(Action::Duplicate(rid));
-                            ui.close();
+                        if resp.drag_started() {
+                            self.drag = Some(Item::Request(rid));
                         }
-                        ui.separator();
-                        if ui.button("Delete request").clicked() {
-                            actions.push(Action::AskDelete(Item::Request(rid)));
-                            ui.close();
-                        }
-                    });
+                        resp.context_menu(|ui| {
+                            if kit::menu_item(ui, Some(Icon::Pencil), "Rename", false).clicked() {
+                                actions.push(Action::StartRename(Item::Request(rid)));
+                                ui.close();
+                            }
+                            if kit::menu_item(ui, Some(Icon::Copy), "Duplicate", false).clicked() {
+                                actions.push(Action::Duplicate(rid));
+                                ui.close();
+                            }
+                            kit::menu_separator(ui);
+                            if kit::menu_item(ui, Some(Icon::Trash), "Delete request", true)
+                                .clicked()
+                            {
+                                actions.push(Action::AskDelete(Item::Request(rid)));
+                                ui.close();
+                            }
+                        });
+                    }
+                    ui.add_space(space::XS);
                 }
-            }
-            ui.add_space(40.0);
-        });
+                ui.add_space(40.0);
+            });
 
         if cancel {
             self.rename = None;
@@ -504,19 +629,26 @@ impl App {
 
     fn handle_drag(&mut self, ui: &mut Ui, rows: &[(Rect, RowRef)]) {
         let Some(item) = self.drag else { return };
+        let p = theme::palette(ui);
         let ctx = ui.ctx().clone();
-        let (pointer, released, down) =
-            ctx.input(|i| (i.pointer.interact_pos(), i.pointer.any_released(), i.pointer.primary_down()));
-        let Some(p) = pointer else {
+        let (pointer, released, down) = ctx.input(|i| {
+            (
+                i.pointer.interact_pos(),
+                i.pointer.any_released(),
+                i.pointer.primary_down(),
+            )
+        });
+        let Some(pos) = pointer else {
             self.drag = None;
             return;
         };
         ctx.set_cursor_icon(CursorIcon::Grabbing);
 
-        let accent = ui.visuals().selection.stroke.color;
+        let accent = p.accent;
         let painter = ui.painter().clone();
         let line = |y: f32, x0: f32, x1: f32| {
             painter.line_segment([pos2(x0, y), pos2(x1, y)], Stroke::new(2.0, accent));
+            painter.circle_filled(pos2(x0, y), 3.0, accent);
         };
         let x0 = rows.first().map(|r| r.0.left()).unwrap_or(0.0);
         let x1 = rows.first().map(|r| r.0.right()).unwrap_or(0.0);
@@ -537,23 +669,42 @@ impl App {
                     }
                 }
                 if !blocks.is_empty() {
-                    let idx = blocks.iter().filter(|b| b.center().y < p.y).count();
-                    let y = if idx < blocks.len() { blocks[idx].top() - 1.0 } else { blocks[idx - 1].bottom() + 1.0 };
-                    line(y, x0 + 2.0, x1 - 2.0);
+                    let idx = blocks.iter().filter(|b| b.center().y < pos.y).count();
+                    let y = if idx < blocks.len() {
+                        blocks[idx].top() - 1.0
+                    } else {
+                        blocks[idx - 1].bottom() + 1.0
+                    };
+                    line(y, x0 + 4.0, x1 - 4.0);
                     target = Some(DropTarget::FolderAt(idx));
                 }
             }
             Item::Request(_) => {
-                let hit = rows.iter().find(|(r, _)| p.y >= r.top() - 1.0 && p.y <= r.bottom() + 1.0);
+                let hit = rows
+                    .iter()
+                    .find(|(r, _)| pos.y >= r.top() - 1.0 && pos.y <= r.bottom() + 1.0);
                 match hit {
                     Some((rect, RowRef::Request(fi, ri))) => {
-                        let before = p.y < rect.center().y;
-                        let y = if before { rect.top() - 1.0 } else { rect.bottom() + 1.0 };
-                        line(y, rect.left() + 20.0, rect.right() - 2.0);
-                        target = Some(DropTarget::RequestAt { folder: *fi, index: if before { *ri } else { ri + 1 } });
+                        let before = pos.y < rect.center().y;
+                        let y = if before {
+                            rect.top() - 1.0
+                        } else {
+                            rect.bottom() + 1.0
+                        };
+                        line(y, rect.left() + 28.0, rect.right() - 4.0);
+                        target = Some(DropTarget::RequestAt {
+                            folder: *fi,
+                            index: if before { *ri } else { ri + 1 },
+                        });
                     }
                     Some((rect, RowRef::Folder(fi))) => {
-                        painter.rect_stroke(*rect, 4.0, Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+                        painter.rect(
+                            *rect,
+                            CornerRadius::same(radius::MD),
+                            p.tint(accent),
+                            Stroke::new(1.0, accent),
+                            StrokeKind::Inside,
+                        );
                         target = Some(DropTarget::IntoFolder(*fi));
                     }
                     None => {}
@@ -561,18 +712,38 @@ impl App {
             }
         }
 
-        // Floating label under the cursor.
+        // Floating chip under the cursor.
         let label = match item {
-            Item::Folder(id) => self.store.folder_index(id).map(|i| self.store.folders[i].name.clone()),
+            Item::Folder(id) => self
+                .store
+                .folder_index(id)
+                .map(|i| self.store.folders[i].name.clone()),
             Item::Request(id) => self.store.find_request(id).map(|r| r.name.clone()),
         };
         if let Some(label) = label {
-            let lp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::unique("kolibri-drag")));
-            let galley = lp.layout_no_wrap(label, egui::FontId::proportional(13.0), ui.visuals().strong_text_color());
-            let rect = Rect::from_min_size(p + vec2(14.0, 6.0), galley.size() + vec2(16.0, 8.0));
-            lp.rect_filled(rect, 4.0, ui.visuals().window_fill);
-            lp.rect_stroke(rect, 4.0, Stroke::new(1.0, accent), egui::StrokeKind::Inside);
-            lp.galley(rect.min + vec2(8.0, 4.0), galley, Color32::WHITE);
+            let lp = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                Id::unique("kolibri-drag"),
+            ));
+            let galley = lp.layout_no_wrap(label, font::label(), p.text);
+            let rect = Rect::from_min_size(pos + vec2(14.0, 8.0), galley.size() + vec2(20.0, 12.0));
+            lp.add(
+                egui::Shadow {
+                    offset: [0, 4],
+                    blur: 12,
+                    spread: 0,
+                    color: p.shadow,
+                }
+                .as_shape(rect, CornerRadius::same(radius::MD)),
+            );
+            lp.rect(
+                rect,
+                CornerRadius::same(radius::MD),
+                p.bg_elevated,
+                Stroke::new(1.0, p.border_strong),
+                StrokeKind::Inside,
+            );
+            lp.galley(rect.min + vec2(10.0, 6.0), galley, p.text);
         }
 
         if released || !down {
@@ -584,17 +755,24 @@ impl App {
     }
 
     // ------------------------------------------------------------------ main area
+
     fn main_area(&mut self, ui: &mut Ui) {
+        let p = theme::palette(ui);
         let ctx = ui.ctx().clone();
-        let Some(id) = self.store.selected.filter(|id| self.store.find_request(*id).is_some()) else {
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("Select a request on the left, or create a folder and press + to add one.").weak());
-            });
+        let Some(id) = self
+            .store
+            .selected
+            .filter(|id| self.store.find_request(*id).is_some())
+        else {
+            self.no_selection(ui);
             return;
         };
 
-        let mut send_now = ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter)));
-        let beautify_key = ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::B)));
+        let mut send_now = ctx.input_mut(|i| {
+            i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter))
+        });
+        let beautify_key = ctx
+            .input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::B)));
         let mut cancel_send = false;
         let mut changed = false;
         let busy = self.inflight.contains_key(&id);
@@ -603,33 +781,124 @@ impl App {
         let folder_name = self.store.folders[fi].name.clone();
         let req = self.store.find_request_mut(id).unwrap();
 
-        ui.add_space(4.0);
+        // Breadcrumb header.
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&folder_name).weak());
-            ui.label(RichText::new("/").weak());
-            ui.label(RichText::new(&req.name).strong());
+            ui.set_height(size::CONTROL);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            kit::icon(ui, Icon::Folder, size::ICON, p.text_faint);
+            ui.label(
+                RichText::new(&folder_name)
+                    .font(font::body())
+                    .color(p.text_muted),
+            );
+            kit::icon(ui, Icon::ChevronRight, size::ICON_SM, p.text_faint);
+            ui.add(
+                Label::new(RichText::new(&req.name).font(font::title()).color(p.text)).truncate(),
+            );
         });
-        ui.add_space(2.0);
+        ui.add_space(space::SM);
 
-        // URL bar
+        // URL bar: [method ▾ | url .................] [Send ⌘↵]
+        let url_id = Id::unique("kolibri-url-bar");
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("method")
-                .width(92.0)
-                .selected_text(RichText::new(req.method.as_str()).color(method_color(req.method)).strong().monospace())
-                .show_ui(ui, |ui| {
-                    for m in Method::ALL {
-                        let t = RichText::new(m.as_str()).color(method_color(m)).strong().monospace();
-                        changed |= ui.selectable_value(&mut req.method, m, t).changed();
+            let h = size::CONTROL_LG;
+            let send_w = 116.0;
+            let w = (ui.available_width() - send_w - space::SM).max(220.0);
+            let (bar, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+            let focused = ui.memory(|m| m.has_focus(url_id));
+            ui.painter().rect(
+                bar,
+                CornerRadius::same(radius::LG),
+                p.bg_surface,
+                Stroke::new(1.0, if focused { p.accent } else { p.border_strong }),
+                StrokeKind::Inside,
+            );
+            if focused {
+                ui.painter().rect_stroke(
+                    bar.expand(2.0),
+                    CornerRadius::same(radius::LG + 2),
+                    Stroke::new(2.0, p.accent.gamma_multiply(0.25)),
+                    StrokeKind::Outside,
+                );
+            }
+
+            // Method picker.
+            let mrect = Rect::from_min_size(bar.min, vec2(100.0, h));
+            let mresp = ui.interact(mrect, ui.scope_id().with("method_picker"), Sense::click());
+            #[cfg(feature = "qa")]
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(Id::unique("qa_method_picker"), mrect));
+            if mresp.hovered() {
+                ui.painter().rect_filled(
+                    mrect.shrink(3.0),
+                    CornerRadius::same(radius::MD),
+                    p.bg_hover,
+                );
+            }
+            ui.painter().text(
+                pos2(mrect.left() + 14.0, mrect.center().y),
+                Align2::LEFT_CENTER,
+                req.method.as_str(),
+                font::label(),
+                p.method(req.method),
+            );
+            kit::paint_icon(
+                ui.painter(),
+                Rect::from_center_size(
+                    pos2(mrect.right() - 16.0, mrect.center().y),
+                    vec2(12.0, 12.0),
+                ),
+                Icon::ChevronDown,
+                p.text_faint,
+            );
+            ui.painter().vline(
+                mrect.right(),
+                bar.y_range().shrink(8.0),
+                Stroke::new(1.0, p.border_strong),
+            );
+            let mresp = mresp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text("HTTP method");
+            egui::Popup::menu(&mresp).width(160.0).show(|ui| {
+                for m in Method::ALL {
+                    let (r, resp) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), size::CONTROL),
+                        Sense::click(),
+                    );
+                    if resp.hovered() {
+                        ui.painter()
+                            .rect_filled(r, CornerRadius::same(radius::MD), p.bg_hover);
                     }
-                });
-            let send_w = 84.0;
-            let w = (ui.available_width() - send_w - ui.spacing().item_spacing.x).max(100.0);
+                    ui.painter().text(
+                        pos2(r.left() + 10.0, r.center().y),
+                        Align2::LEFT_CENTER,
+                        m.as_str(),
+                        font::label(),
+                        p.method(m),
+                    );
+                    if m == req.method {
+                        kit::paint_icon(
+                            ui.painter(),
+                            Rect::from_center_size(
+                                pos2(r.right() - 16.0, r.center().y),
+                                vec2(14.0, 14.0),
+                            ),
+                            Icon::Check,
+                            p.text_muted,
+                        );
+                    }
+                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() && req.method != m {
+                        req.method = m;
+                        changed = true;
+                    }
+                }
+            });
+
             // A pasted curl command replaces the whole request. Take the paste
             // event before the single-line editor sees it (it would turn
             // newlines into spaces and break line continuations).
-            let url_id = Id::unique("kolibri-url-bar");
             let mut pasted_curl = None;
-            if ui.memory(|m| m.has_focus(url_id)) {
+            if focused {
                 ui.input_mut(|i| {
                     if let Some(pos) = i
                         .events
@@ -652,13 +921,19 @@ impl App {
                     Err(e) => self.curl_err = Some(format!("cURL import failed: {e}")),
                 }
             }
-            let url = ui.add(
+            let trect = Rect::from_min_max(
+                pos2(mrect.right() + 1.0, bar.top()),
+                pos2(bar.right() - 4.0, bar.bottom()),
+            );
+            let url = ui.put(
+                trect,
                 TextEdit::singleline(&mut req.url)
                     .id(url_id)
-                    .hint_text("https://api.example.com/resource  (or paste a cURL command)")
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(w)
-                    .min_size(vec2(0.0, 26.0))
+                    .frame(Frame::NONE.inner_margin(Margin::symmetric(10, 0)))
+                    .hint_text("https://api.example.com/resource   or paste a cURL command")
+                    .font(font::mono())
+                    .desired_width(f32::INFINITY)
+                    .min_size(trect.size())
                     .align(Align2::LEFT_CENTER),
             );
             if url.changed() {
@@ -669,22 +944,42 @@ impl App {
             if url.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 send_now = true;
             }
+
             if busy {
-                if ui.add_sized([send_w, 26.0], egui::Button::new("Cancel")).clicked() {
+                let b = kit::Button::secondary("Cancel")
+                    .icon(Icon::Stop)
+                    .height(h)
+                    .min_width(send_w);
+                if ui.add(b).clicked() {
                     cancel_send = true;
                 }
             } else {
-                let b = egui::Button::new(RichText::new("Send").strong().color(Color32::WHITE))
-                    .fill(Color32::from_rgb(0x25, 0x63, 0xEB));
-                if ui.add_sized([send_w, 26.0], b).on_hover_text("Ctrl+Enter").clicked() {
+                let hint = shortcut("↵");
+                let b = kit::Button::primary("Send")
+                    .icon(Icon::Send)
+                    .shortcut(&hint)
+                    .height(h)
+                    .min_width(send_w);
+                if ui
+                    .add(b)
+                    .on_hover_text(format!("Send request ({hint})"))
+                    .clicked()
+                {
                     send_now = true;
                 }
             }
         });
         if let Some(e) = &self.curl_err {
-            ui.label(RichText::new(e).color(ui.visuals().error_fg_color).small());
+            ui.add_space(space::SM);
+            kit::callout(
+                ui,
+                p.danger,
+                Icon::ErrorCircle,
+                "Could not import cURL command",
+                e.trim_start_matches("cURL import failed: "),
+            );
         }
-        ui.add_space(4.0);
+        ui.add_space(space::LG);
 
         // Response at the bottom (resizable), request editor fills the rest.
         let avail_h = ui.available_height();
@@ -693,8 +988,13 @@ impl App {
         egui::Panel::bottom("response_panel")
             .resizable(true)
             .default_size(avail_h * 0.55)
-            .min_size(120.0)
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 6, ..Default::default() }))
+            .min_size(160.0)
+            .max_size((avail_h - 150.0).max(160.0))
+            .frame(Frame::NONE.inner_margin(Margin {
+                top: space::MD as i8,
+                bottom: space::MD as i8,
+                ..Default::default()
+            }))
             .show(ui, |ui| {
                 ui.set_min_height(ui.available_height());
                 response_area(
@@ -708,22 +1008,64 @@ impl App {
                     &mut self.load_cache,
                     &mut start_load,
                     &mut stop_load,
+                    &mut cancel_send,
                 );
             });
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
+            let np = req
+                .params
+                .iter()
+                .filter(|p| p.enabled && !p.key.is_empty())
+                .count();
+            let nh = req
+                .headers
+                .iter()
+                .filter(|p| p.enabled && !p.key.is_empty())
+                .count();
+            let nb = usize::from(req.body_kind != BodyKind::None && !req.body.is_empty());
+            let mut do_beautify = beautify_key;
             ui.horizontal(|ui| {
-                let np = req.params.iter().filter(|p| p.enabled && !p.key.is_empty()).count();
-                let nh = req.headers.iter().filter(|p| p.enabled && !p.key.is_empty()).count();
-                tab(ui, &mut self.req_tab, ReqTab::Params, "Params", np);
-                tab(ui, &mut self.req_tab, ReqTab::Headers, "Headers", nh);
-                let nb = usize::from(req.body_kind != BodyKind::None && !req.body.is_empty());
-                tab(ui, &mut self.req_tab, ReqTab::Body, "Body", nb);
+                kit::segmented(
+                    ui,
+                    "req_tabs",
+                    &mut self.req_tab,
+                    &[
+                        seg(ReqTab::Params, "Params", np),
+                        seg(ReqTab::Headers, "Headers", nh),
+                        seg(ReqTab::Body, "Body", nb),
+                    ],
+                );
+                if self.req_tab == ReqTab::Body {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let enabled =
+                            req.body_kind != BodyKind::None && !req.body.trim().is_empty();
+                        let hint = shortcut("B");
+                        let b = kit::Button::ghost("Beautify")
+                            .icon(Icon::Braces)
+                            .shortcut(&hint)
+                            .enabled(enabled);
+                        if ui.add(b).on_hover_text("Format the JSON body").clicked() {
+                            do_beautify = true;
+                        }
+                        ui.add_space(space::XS);
+                        changed |= kit::segmented(
+                            ui,
+                            "body_kind",
+                            &mut req.body_kind,
+                            &[
+                                seg(BodyKind::None, "None", 0),
+                                seg(BodyKind::Json, "JSON", 0),
+                                seg(BodyKind::Text, "Text", 0),
+                            ],
+                        );
+                    });
+                }
             });
-            ui.separator();
+            ui.add_space(space::MD);
             match self.req_tab {
                 ReqTab::Params => {
-                    if kv_table(ui, "params", &mut req.params, "key", "value") {
+                    if kv_table(ui, "params", &mut req.params, "Key", "Value") {
                         model::url_from_params(req);
                         changed = true;
                     }
@@ -732,22 +1074,8 @@ impl App {
                     changed |= kv_table(ui, "headers", &mut req.headers, "Header", "Value");
                 }
                 ReqTab::Body => {
-                    let mut do_beautify = beautify_key;
-                    ui.horizontal(|ui| {
-                        changed |= ui.radio_value(&mut req.body_kind, BodyKind::None, "None").changed();
-                        changed |= ui.radio_value(&mut req.body_kind, BodyKind::Json, "JSON").changed();
-                        changed |= ui.radio_value(&mut req.body_kind, BodyKind::Text, "Text").changed();
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let enabled = req.body_kind != BodyKind::None && !req.body.trim().is_empty();
-                            if ui.add_enabled(enabled, egui::Button::new("Beautify")).on_hover_text("Format JSON (Ctrl+B)").clicked() {
-                                do_beautify = true;
-                            }
-                            if let Some(e) = &self.beautify_err {
-                                ui.label(RichText::new(e).color(ui.visuals().error_fg_color).small());
-                            }
-                        });
-                    });
-                    if do_beautify && req.body_kind != BodyKind::None && !req.body.trim().is_empty() {
+                    if do_beautify && req.body_kind != BodyKind::None && !req.body.trim().is_empty()
+                    {
                         match http::beautify_json(&req.body) {
                             Ok(s) => {
                                 if s != req.body {
@@ -759,29 +1087,56 @@ impl App {
                             Err(e) => self.beautify_err = Some(e),
                         }
                     }
+                    if let Some(e) = &self.beautify_err {
+                        kit::callout(ui, p.warning, Icon::Alert, "Could not beautify the body", e);
+                        ui.add_space(space::SM);
+                    }
                     if req.body_kind == BodyKind::None {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("This request has no body.").weak());
+                        ui.add_space(space::XL);
+                        kit::empty_state(
+                            ui,
+                            Icon::Braces,
+                            "No body",
+                            "This request is sent without a body. Choose JSON or Text to add one.",
+                            &[],
+                        );
                     } else {
                         let json = req.body_kind == BodyKind::Json;
                         let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap: f32| {
-                            let mut job = json_job(text.as_str(), mono(ui), ui.visuals().dark_mode, json);
+                            let mut job =
+                                json_job(text.as_str(), font::mono(), ui.visuals().dark_mode, json);
                             job.wrap.max_width = wrap;
                             ui.fonts_mut(|f| f.layout_job(job))
                         };
-                        ScrollArea::vertical().id_salt("body_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                            let r = ui.add(
-                                TextEdit::multiline(&mut req.body)
-                                    .code_editor()
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(14)
-                                    .hint_text(if json { "{\n  \"key\": \"value\"\n}" } else { "Request body" })
-                                    .layouter(&mut layouter),
-                            );
-                            if r.changed() {
-                                changed = true;
-                                self.beautify_err = None;
-                            }
+                        let h = (ui.available_height() - space::MD).max(60.0);
+                        kit::card(p).inner_margin(Margin::same(0)).show(ui, |ui| {
+                            ScrollArea::vertical()
+                                .id_salt("body_scroll")
+                                .max_height(h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let r = ui.add(
+                                        TextEdit::multiline(&mut req.body)
+                                            .code_editor()
+                                            .frame(
+                                                Frame::NONE
+                                                    .inner_margin(Margin::same(space::MD as i8)),
+                                            )
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(12)
+                                            .min_size(vec2(0.0, h))
+                                            .hint_text(if json {
+                                                "{\n  \"key\": \"value\"\n}"
+                                            } else {
+                                                "Request body"
+                                            })
+                                            .layouter(&mut layouter),
+                                    );
+                                    if r.changed() {
+                                        changed = true;
+                                        self.beautify_err = None;
+                                    }
+                                });
                         });
                     }
                 }
@@ -806,24 +1161,92 @@ impl App {
             let req = self.store.find_request(id).unwrap();
             match http::prepare(req) {
                 Ok(p) => {
-                    self.loads.insert(id, loadtest::Run::start(p, self.load_cfg.clone(), ctx.clone()));
+                    self.loads.insert(
+                        id,
+                        loadtest::Run::start(p, self.load_cfg.clone(), ctx.clone()),
+                    );
                     self.load_cache = None;
                 }
                 Err(e) => {
-                    self.responses.insert(id, ResponseView { result: Err(e), galley: None });
+                    self.responses.insert(
+                        id,
+                        ResponseView {
+                            result: Err(e),
+                            galley: None,
+                        },
+                    );
                     self.resp_tab = RespTab::Body;
                 }
             }
         }
     }
 
+    /// Main area when no request is selected.
+    fn no_selection(&mut self, ui: &mut Ui) {
+        let first_folder = self.store.folders.first().map(|f| f.id);
+        let mut action = None;
+        ui.add_space((ui.available_height() * 0.28).max(space::XL));
+        let (title, body) = if first_folder.is_some() {
+            (
+                "No request selected",
+                "Pick a request in the sidebar, or create a new one.",
+            )
+        } else {
+            (
+                "Welcome to Kolibri",
+                "Create a folder to start collecting requests.",
+            )
+        };
+        kit::empty_state(ui, Icon::Send, title, body, &[]);
+        ui.add_space(space::LG);
+        ui.vertical_centered(|ui| {
+            // Center the button row by measuring it.
+            let w = if first_folder.is_some() { 260.0 } else { 120.0 };
+            ui.allocate_ui(vec2(w, size::CONTROL), |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(fid) = first_folder {
+                        if ui
+                            .add(kit::Button::primary("New request").icon(Icon::Plus))
+                            .clicked()
+                        {
+                            action = Some(Action::NewRequest(fid));
+                        }
+                    }
+                    if ui
+                        .add(kit::Button::secondary("New folder").icon(Icon::FolderPlus))
+                        .clicked()
+                    {
+                        action = Some(Action::NewFolder);
+                    }
+                });
+            });
+        });
+        if let Some(a) = action {
+            self.apply(a);
+        }
+    }
+
     fn delete_modal(&mut self, ctx: &egui::Context) {
-        let Some(item) = self.confirm_delete else { return };
+        let Some(item) = self.confirm_delete else {
+            return;
+        };
+        let p = theme::palette_for(ctx.global_style().visuals.dark_mode);
         let (title, detail) = match item {
             Item::Folder(id) => match self.store.folder_index(id) {
                 Some(i) => {
                     let f = &self.store.folders[i];
-                    (format!("Delete folder \"{}\"?", f.name), format!("This also deletes its {} request(s).", f.requests.len()))
+                    let n = f.requests.len();
+                    (
+                        format!("Delete folder “{}”?", f.name),
+                        if n == 0 {
+                            "The folder is empty. This can't be undone.".to_owned()
+                        } else {
+                            format!(
+                                "This also deletes its {n} request{}. This can't be undone.",
+                                if n == 1 { "" } else { "s" }
+                            )
+                        },
+                    )
                 }
                 None => {
                     self.confirm_delete = None;
@@ -831,7 +1254,10 @@ impl App {
                 }
             },
             Item::Request(id) => match self.store.find_request(id) {
-                Some(r) => (format!("Delete request \"{}\"?", r.name), String::new()),
+                Some(r) => (
+                    format!("Delete request “{}”?", r.name),
+                    "This can't be undone.".to_owned(),
+                ),
                 None => {
                     self.confirm_delete = None;
                     return;
@@ -839,23 +1265,71 @@ impl App {
             },
         };
         let mut decision = None;
-        let resp = egui::Modal::new(Id::unique("confirm_delete")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.label(RichText::new(title).strong());
-            if !detail.is_empty() {
-                ui.label(detail);
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let del = egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(Color32::from_rgb(0xC0, 0x39, 0x2B));
-                if ui.add(del).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                    decision = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    decision = Some(false);
-                }
+        let frame = Frame::new()
+            .fill(p.bg_elevated)
+            .stroke(Stroke::new(1.0, p.border_strong))
+            .corner_radius(CornerRadius::same(radius::XL))
+            .inner_margin(Margin::same(space::XL as i8))
+            .shadow(egui::Shadow {
+                offset: [0, 12],
+                blur: 40,
+                spread: 0,
+                color: p.shadow,
             });
-        });
+        let resp = egui::Modal::new(Id::unique("confirm_delete"))
+            .frame(frame)
+            .backdrop_color(Color32::from_black_alpha(if p.dark { 150 } else { 70 }))
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.horizontal_top(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+                    ui.painter().rect(
+                        r,
+                        CornerRadius::same(radius::LG),
+                        p.tint(p.danger),
+                        Stroke::new(1.0, p.tint_border(p.danger)),
+                        StrokeKind::Inside,
+                    );
+                    kit::paint_icon(
+                        ui.painter(),
+                        Rect::from_center_size(r.center(), vec2(18.0, 18.0)),
+                        Icon::Trash,
+                        p.danger,
+                    );
+                    ui.add_space(space::XS);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = space::XS;
+                        ui.add(
+                            Label::new(RichText::new(&title).font(font::heading()).color(p.text))
+                                .wrap(),
+                        );
+                        ui.add(
+                            Label::new(
+                                RichText::new(&detail)
+                                    .font(font::body())
+                                    .color(p.text_muted),
+                            )
+                            .wrap(),
+                        );
+                    });
+                });
+                ui.add_space(space::XL);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(kit::Button::danger("Delete").min_width(84.0))
+                        .clicked()
+                        || ui.input(|i| i.key_pressed(Key::Enter))
+                    {
+                        decision = Some(true);
+                    }
+                    if ui
+                        .add(kit::Button::secondary("Cancel").min_width(84.0))
+                        .clicked()
+                    {
+                        decision = Some(false);
+                    }
+                });
+            });
         if resp.should_close() && decision.is_none() {
             decision = Some(false);
         }
@@ -891,6 +1365,11 @@ impl eframe::App for App {
         self.draw(ui);
     }
 
+    #[cfg(feature = "qa")]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        qa::raw_input(self, raw);
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.dirty {
             self.save_now();
@@ -902,27 +1381,57 @@ impl App {
     /// One frame of the whole window.
     fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        #[cfg(feature = "qa")]
+        qa::tick(self, &ctx);
+        let p = theme::palette(ui);
         self.poll_inflight();
         self.shortcuts(&ctx);
 
         if let Some(n) = self.notice.clone() {
-            egui::Panel::top("notice").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(n).color(ui.visuals().warn_fg_color));
-                    if ui.small_button("Dismiss").clicked() {
-                        self.notice = None;
-                    }
+            egui::Panel::top("notice")
+                .show_separator_line(false)
+                .frame(
+                    Frame::new()
+                        .fill(p.tint(p.warning))
+                        .stroke(Stroke::new(1.0, p.tint_border(p.warning)))
+                        .inner_margin(Margin::symmetric(space::LG as i8, 6)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        kit::icon(ui, Icon::Alert, size::ICON, p.warning);
+                        ui.add(
+                            Label::new(RichText::new(n).font(font::body()).color(p.text))
+                                .truncate(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.add(kit::Button::ghost("Dismiss").small()).clicked() {
+                                self.notice = None;
+                            }
+                        });
+                    });
                 });
-            });
         }
 
         egui::Panel::left("sidebar")
             .resizable(true)
-            .default_size(250.0)
-            .min_size(160.0)
+            .default_size(size::SIDEBAR_DEFAULT)
+            .size_range(size::SIDEBAR_MIN..=size::SIDEBAR_MAX)
+            .frame(Frame::new().fill(p.bg_sidebar).inner_margin(Margin {
+                left: 10,
+                right: 10,
+                top: 12,
+                bottom: 0,
+            }))
             .show(ui, |ui| self.sidebar(ui));
 
-        egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(p.bg_app).inner_margin(Margin {
+                left: 20,
+                right: 20,
+                top: 14,
+                bottom: 0,
+            }))
+            .show(ui, |ui| self.main_area(ui));
 
         self.delete_modal(&ctx);
 
@@ -938,155 +1447,332 @@ impl App {
 
 // ---------------------------------------------------------------------- widgets
 
-fn tab<T: PartialEq + Copy>(ui: &mut Ui, cur: &mut T, val: T, label: &str, count: usize) {
-    let text = if count > 0 { format!("{label} ({count})") } else { label.to_owned() };
-    let selected = *cur == val;
-    let rt = if selected { RichText::new(text).strong() } else { RichText::new(text) };
-    if ui.selectable_label(selected, rt).clicked() {
-        *cur = val;
-    }
-}
-
-fn x_button(ui: &mut Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
-    let v = ui.visuals();
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, v.widgets.hovered.weak_bg_fill);
-    }
-    let c = rect.center();
-    let d = 4.0;
-    let color = if resp.hovered() { v.strong_text_color() } else { v.weak_text_color() };
-    let st = Stroke::new(1.5, color);
-    ui.painter().line_segment([c + vec2(-d, -d), c + vec2(d, d)], st);
-    ui.painter().line_segment([c + vec2(-d, d), c + vec2(d, -d)], st);
-    resp.on_hover_cursor(CursorIcon::PointingHand)
-}
-
-fn paint_row_bg(ui: &Ui, rect: Rect, selected: bool, hovered: bool) {
-    let v = ui.visuals();
+fn row_bg(ui: &Ui, rect: Rect, p: &Palette, selected: bool, hovered: bool) {
+    let cr = CornerRadius::same(radius::MD);
     if selected {
-        ui.painter().rect_filled(rect, 4.0, v.selection.bg_fill.gamma_multiply(0.6));
+        ui.painter().rect_filled(rect, cr, p.bg_active);
     } else if hovered {
-        ui.painter().rect_filled(rect, 4.0, v.widgets.hovered.weak_bg_fill);
+        ui.painter().rect_filled(rect, cr, p.bg_hover);
     }
 }
 
 fn folder_row(ui: &mut Ui, folder: &Folder, dragging: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
-    let hovered = resp.hovered() && !dragging;
-    paint_row_bg(ui, rect, false, hovered);
-    let v = ui.visuals();
-    let color = if dragging { v.weak_text_color() } else { v.strong_text_color() };
-    let painter = ui.painter_at(rect);
-
-    // Disclosure triangle
-    let c = pos2(rect.left() + 12.0, rect.center().y);
-    let s = 4.0;
-    let pts = if folder.expanded {
-        vec![c + vec2(-s, -s * 0.6), c + vec2(s, -s * 0.6), c + vec2(0.0, s * 0.8)]
-    } else {
-        vec![c + vec2(-s * 0.6, -s), c + vec2(s * 0.8, 0.0), c + vec2(-s * 0.6, s)]
-    };
-    painter.add(egui::Shape::convex_polygon(pts, v.text_color(), Stroke::NONE));
-
-    let font = egui::FontId::proportional(14.0);
-    let name_clip = Rect::from_min_max(rect.min, pos2(rect.right() - 54.0, rect.bottom()));
-    ui.painter_at(name_clip).text(pos2(rect.left() + 24.0, rect.center().y), Align2::LEFT_CENTER, &folder.name, font, color);
-    painter.text(
-        pos2(rect.right() - 30.0, rect.center().y),
-        Align2::RIGHT_CENTER,
-        folder.requests.len().to_string(),
-        egui::FontId::proportional(11.0),
-        v.weak_text_color(),
+    let p = theme::palette(ui);
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(ui.available_width(), size::ROW),
+        Sense::click_and_drag(),
     );
-    if resp.hovered() {
-        painter.text(pos2(rect.right() - 13.0, rect.center().y), Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), v.strong_text_color());
+    let hovered = resp.hovered() && !dragging;
+    row_bg(ui, rect, p, false, hovered);
+    let painter = ui.painter();
+    let cy = rect.center().y;
+    let chevron = if folder.expanded {
+        Icon::ChevronDown
+    } else {
+        Icon::ChevronRight
+    };
+    kit::paint_icon(
+        painter,
+        Rect::from_center_size(pos2(rect.left() + 11.0, cy), vec2(11.0, 11.0)),
+        chevron,
+        p.text_faint,
+    );
+    kit::paint_icon(
+        painter,
+        Rect::from_center_size(pos2(rect.left() + 28.0, cy), vec2(14.0, 14.0)),
+        Icon::Folder,
+        p.text_muted,
+    );
+
+    let color = if dragging { p.text_faint } else { p.text };
+    let right_reserved = 34.0;
+    kit::paint_text_clipped(
+        ui,
+        pos2(rect.left() + 42.0, cy),
+        Align2::LEFT_CENTER,
+        &folder.name,
+        font::label(),
+        color,
+        rect.width() - 42.0 - right_reserved,
+    );
+
+    if resp.hovered() && !dragging {
+        let r = Rect::from_center_size(pos2(rect.right() - 14.0, cy), vec2(22.0, 22.0));
+        let on = resp.hover_pos().is_some_and(|h| r.expand(3.0).contains(h));
+        if on {
+            ui.painter()
+                .rect_filled(r, CornerRadius::same(radius::SM), p.bg_active);
+        }
+        kit::paint_icon(
+            ui.painter(),
+            Rect::from_center_size(r.center(), vec2(13.0, 13.0)),
+            Icon::Plus,
+            if on { p.text } else { p.text_muted },
+        );
+    } else {
+        ui.painter().text(
+            pos2(rect.right() - 10.0, cy),
+            Align2::RIGHT_CENTER,
+            folder.requests.len().to_string(),
+            font::small(),
+            p.text_faint,
+        );
     }
+    let resp = if resp.hovered() {
+        resp.on_hover_text_at_pointer("Click + to add a request")
+    } else {
+        resp
+    };
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-fn request_row(ui: &mut Ui, req: &Request, selected: bool, busy: bool, dragging: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
-    paint_row_bg(ui, rect, selected, resp.hovered() && !dragging);
-    let v = ui.visuals();
-    let painter = ui.painter_at(rect);
-    let mfont = egui::FontId::monospace(10.5);
-    let mc = if dragging { v.weak_text_color() } else { method_color(req.method) };
-    painter.text(pos2(rect.left() + 26.0, rect.center().y), Align2::LEFT_CENTER, req.method.as_str(), mfont, mc);
-    let tc = if dragging { v.weak_text_color() } else if selected { v.strong_text_color() } else { v.text_color() };
-    let right = if busy { rect.right() - 18.0 } else { rect.right() - 4.0 };
-    ui.painter_at(Rect::from_min_max(rect.min, pos2(right, rect.bottom()))).text(
-        pos2(rect.left() + 78.0, rect.center().y),
+fn request_row(
+    ui: &mut Ui,
+    req: &Request,
+    selected: bool,
+    busy: bool,
+    dragging: bool,
+) -> egui::Response {
+    let p = theme::palette(ui);
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(ui.available_width(), size::ROW),
+        Sense::click_and_drag(),
+    );
+    row_bg(ui, rect, p, selected, resp.hovered() && !dragging);
+    let cy = rect.center().y;
+    let mc = if dragging {
+        p.text_faint
+    } else {
+        p.method(req.method)
+    };
+    ui.painter().text(
+        pos2(rect.left() + 28.0, cy),
         Align2::LEFT_CENTER,
-        &req.name,
-        egui::FontId::proportional(13.5),
+        method_short(req.method),
+        font::mono_small(),
+        mc,
+    );
+    let tc = if dragging {
+        p.text_faint
+    } else if selected {
+        p.text
+    } else {
+        mix(p.text, p.text_muted, 0.45)
+    };
+    let x = rect.left() + 68.0;
+    let right = if busy { 22.0 } else { 8.0 };
+    let name = if req.name.is_empty() {
+        "Untitled"
+    } else {
+        &req.name
+    };
+    kit::paint_text_clipped(
+        ui,
+        pos2(x, cy),
+        Align2::LEFT_CENTER,
+        name,
+        font::body(),
         tc,
+        rect.right() - right - x,
     );
     if busy {
-        painter.circle_filled(pos2(rect.right() - 9.0, rect.center().y), 3.5, Color32::from_rgb(0x25, 0x63, 0xEB));
+        ui.painter()
+            .circle_filled(pos2(rect.right() - 11.0, cy), 3.5, p.accent);
     }
     resp
 }
 
 /// Returns (rect, commit, cancel).
 fn rename_row(ui: &mut Ui, r: &mut Rename, indent: f32) -> (Rect, bool, bool) {
+    let p = theme::palette(ui);
     let mut commit = false;
     let mut cancel = false;
-    let inner = ui.horizontal(|ui| {
-        ui.add_space(indent);
-        let te = ui.add(TextEdit::singleline(&mut r.text).desired_width(ui.available_width() - 4.0));
-        if r.focus {
-            te.request_focus();
-            if let Some(mut st) = TextEdit::load_state(ui.ctx(), te.id) {
-                let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(r.text.chars().count()));
-                st.cursor.set_char_range(Some(all));
-                st.store(ui.ctx(), te.id);
-            }
-            r.focus = false;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), size::ROW), Sense::hover());
+    let field = Rect::from_min_max(
+        pos2(rect.left() + indent, rect.top() + 2.0),
+        pos2(rect.right() - 2.0, rect.bottom() - 2.0),
+    );
+    let te = ui.put(
+        field,
+        TextEdit::singleline(&mut r.text)
+            .frame(
+                Frame::new()
+                    .fill(p.bg_surface)
+                    .stroke(Stroke::new(1.0, p.accent))
+                    .corner_radius(CornerRadius::same(radius::MD))
+                    .inner_margin(Margin::symmetric(8, 0)),
+            )
+            .font(font::body())
+            .desired_width(f32::INFINITY)
+            .min_size(field.size())
+            .align(Align2::LEFT_CENTER),
+    );
+    if r.focus {
+        te.request_focus();
+        if let Some(mut st) = TextEdit::load_state(ui.ctx(), te.id) {
+            let all = egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(r.text.chars().count()),
+            );
+            st.cursor.set_char_range(Some(all));
+            st.store(ui.ctx(), te.id);
         }
-        if ui.input(|i| i.key_pressed(Key::Escape)) {
-            cancel = true;
-        } else if te.lost_focus() {
-            commit = true;
-        }
-    });
-    (inner.response.rect, commit, cancel)
+        r.focus = false;
+    }
+    if ui.input(|i| i.key_pressed(Key::Escape)) {
+        cancel = true;
+    } else if te.lost_focus() {
+        commit = true;
+    }
+    (rect, commit, cancel)
 }
 
 /// Editable key/value table with an always-present blank row at the end.
-fn kv_table(ui: &mut Ui, id: &str, rows: &mut Vec<KeyValue>, key_hint: &str, val_hint: &str) -> bool {
+fn kv_table(
+    ui: &mut Ui,
+    id: &str,
+    rows: &mut Vec<KeyValue>,
+    key_hint: &str,
+    val_hint: &str,
+) -> bool {
+    let p = theme::palette(ui);
     if rows.last().is_none_or(|r| !r.is_blank()) {
         rows.push(KeyValue::default());
     }
     let mut changed = false;
     let mut remove = None;
     let last = rows.len() - 1;
-    ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
-        let col = ((ui.available_width() - 64.0) / 2.0).max(80.0);
-        for (i, row) in rows.iter_mut().enumerate() {
-            let ghost = i == last;
-            ui.horizontal(|ui| {
-                if ghost {
-                    let mut dummy = true;
-                    ui.add_visible(false, egui::Checkbox::new(&mut dummy, ""));
+    ScrollArea::vertical()
+        .id_salt(id)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let w = ui.available_width();
+            let check_w = 36.0;
+            let del_w = 36.0;
+            let col = ((w - check_w - del_w) / 2.0).floor();
+            let head_h = 30.0;
+            let row_h = size::TABLE_ROW;
+            let top = ui.cursor().top();
+            let table = Rect::from_min_size(
+                pos2(ui.cursor().left(), top),
+                vec2(w, head_h + row_h * rows.len() as f32),
+            );
+
+            // Header.
+            let (head, _) = ui.allocate_exact_size(vec2(w, head_h), Sense::hover());
+            ui.painter().rect_filled(
+                head,
+                CornerRadius {
+                    nw: radius::LG,
+                    ne: radius::LG,
+                    sw: 0,
+                    se: 0,
+                },
+                mix(p.bg_app, p.text, if p.dark { 0.03 } else { 0.025 }),
+            );
+            let hx = head.left() + check_w;
+            for (x, label) in [(hx + 10.0, key_hint), (hx + col + 10.0, val_hint)] {
+                ui.painter().text(
+                    pos2(x, head.center().y),
+                    Align2::LEFT_CENTER,
+                    label.to_uppercase(),
+                    font::overline(),
+                    p.text_faint,
+                );
+            }
+
+            for (i, row) in rows.iter_mut().enumerate() {
+                let ghost = i == last;
+                let (rr, _) = ui.allocate_exact_size(vec2(w, row_h), Sense::hover());
+                ui.painter()
+                    .hline(rr.x_range(), rr.top(), Stroke::new(1.0, p.border));
+                let hovered = ui.rect_contains_pointer(rr);
+                if hovered && !ghost {
+                    ui.painter().rect_filled(
+                        rr.shrink2(vec2(1.0, 0.0)).with_min_y(rr.top() + 1.0),
+                        CornerRadius::ZERO,
+                        mix(p.bg_app, p.bg_hover, 0.6),
+                    );
+                }
+                let check = Rect::from_min_size(rr.min, vec2(check_w, row_h));
+                let kcell = Rect::from_min_size(pos2(check.right(), rr.top()), vec2(col, row_h));
+                let vcell = Rect::from_min_size(pos2(kcell.right(), rr.top()), vec2(col, row_h));
+                let dcell = Rect::from_min_max(pos2(vcell.right(), rr.top()), rr.max);
+                ui.painter()
+                    .vline(kcell.left(), rr.y_range(), Stroke::new(1.0, p.border));
+                ui.painter()
+                    .vline(vcell.left(), rr.y_range(), Stroke::new(1.0, p.border));
+
+                if !ghost {
+                    changed |= kit::checkbox_at(
+                        ui,
+                        check,
+                        ui.scope_id().with((id, "check", i)),
+                        &mut row.enabled,
+                        "Include",
+                    )
+                    .changed();
                 } else {
-                    changed |= ui.checkbox(&mut row.enabled, "").on_hover_text("Include").changed();
+                    kit::paint_icon(
+                        ui.painter(),
+                        Rect::from_center_size(check.center(), vec2(12.0, 12.0)),
+                        Icon::Plus,
+                        p.text_faint,
+                    );
                 }
-                let k = ui.add_sized(
-                    [col, 24.0],
-                    TextEdit::singleline(&mut row.key).hint_text(key_hint).font(egui::TextStyle::Monospace),
-                );
-                let v = ui.add_sized(
-                    [col, 24.0],
-                    TextEdit::singleline(&mut row.value).hint_text(val_hint).font(egui::TextStyle::Monospace),
-                );
-                changed |= k.changed() || v.changed();
-                if !ghost && x_button(ui).on_hover_text("Remove").clicked() {
-                    remove = Some(i);
+                let text_color = if row.enabled || ghost {
+                    p.text
+                } else {
+                    p.text_faint
+                };
+                for (cell, text, hint) in [
+                    (kcell, &mut row.key, key_hint),
+                    (vcell, &mut row.value, val_hint),
+                ] {
+                    let inner = cell.shrink2(vec2(1.0, 1.0));
+                    let r = ui.put(
+                        inner,
+                        TextEdit::singleline(text)
+                            .frame(Frame::NONE.inner_margin(Margin::symmetric(10, 0)))
+                            .hint_text(hint)
+                            .font(font::mono())
+                            .text_color(text_color)
+                            .desired_width(f32::INFINITY)
+                            .min_size(inner.size())
+                            .align(Align2::LEFT_CENTER),
+                    );
+                    if r.has_focus() {
+                        ui.painter().rect_stroke(
+                            inner,
+                            CornerRadius::same(radius::SM),
+                            Stroke::new(1.0, p.accent),
+                            StrokeKind::Inside,
+                        );
+                    }
+                    changed |= r.changed();
                 }
-            });
-        }
-    });
+                if !ghost {
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(dcell)
+                            .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+                    );
+                    child.set_clip_rect(dcell.intersect(ui.clip_rect()));
+                    let resp = kit::icon_button_sized(&mut child, Icon::Close, "Remove", 22.0);
+                    if resp.clicked() {
+                        remove = Some(i);
+                    }
+                }
+            }
+            ui.painter().rect_stroke(
+                table,
+                CornerRadius::same(radius::LG),
+                Stroke::new(1.0, p.border),
+                StrokeKind::Inside,
+            );
+            ui.add_space(space::MD);
+        });
     if let Some(i) = remove {
         rows.remove(i);
         changed = true;
@@ -1106,26 +1792,53 @@ fn response_area(
     cache: &mut Option<(Instant, u64, loadtest::Summary)>,
     start_load: &mut bool,
     stop_load: &mut bool,
+    cancel_send: &mut bool,
 ) {
+    let p = theme::palette(ui);
     let view = responses.get_mut(&id);
     let ok = view.as_ref().and_then(|v| v.result.as_ref().ok());
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Response").strong());
-        ui.add_space(8.0);
-        tab(ui, tab_state, RespTab::Body, "Body", 0);
-        tab(ui, tab_state, RespTab::Headers, "Headers", ok.map_or(0, |r| r.headers.len()));
-        tab(ui, tab_state, RespTab::LoadTest, "Load test", 0);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if *tab_state != RespTab::LoadTest {
-                if let Some(r) = ok {
-                    ui.label(RichText::new(fmt_size(r.size as u64)).weak());
-                    ui.label(RichText::new(fmt_dur(r.elapsed)).weak());
-                    ui.label(RichText::new(format!("{} {}", r.status, r.reason)).color(status_color(r.status)).strong());
-                }
+        ui.set_height(size::CONTROL);
+        if ui.available_width() > 560.0 {
+            ui.label(RichText::new("Response").font(font::label()).color(p.text));
+            ui.add_space(space::XS);
+        }
+        kit::segmented(
+            ui,
+            "resp_tabs",
+            tab_state,
+            &[
+                seg(RespTab::Body, "Body", 0),
+                seg(
+                    RespTab::Headers,
+                    "Headers",
+                    ok.map_or(0, |r| r.headers.len()),
+                ),
+                seg(RespTab::LoadTest, "Load test", 0),
+            ],
+        );
+        if *tab_state != RespTab::LoadTest {
+            if let Some(r) = ok {
+                let room = ui.available_width();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if room > 250.0 {
+                        kit::meta(ui, "Size", &fmt_size(r.size as u64));
+                        ui.add_space(space::SM);
+                        kit::meta(ui, "Time", &fmt_dur(r.elapsed));
+                        ui.add_space(space::SM);
+                    }
+                    let text = if r.reason.is_empty() {
+                        r.status.to_string()
+                    } else {
+                        format!("{} {}", r.status, r.reason)
+                    };
+                    kit::status_badge(ui, &text, p.status(r.status));
+                });
             }
-        });
+        }
     });
-    ui.separator();
+    ui.add_space(space::MD);
 
     if *tab_state == RespTab::LoadTest {
         load_test_ui(ui, id, loads.get(&id), cfg, cache, start_load, stop_load);
@@ -1133,23 +1846,48 @@ fn response_area(
     }
 
     if let Some((started, _)) = inflight.get(&id) {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label(format!("Sending… {:.1}s", started.elapsed().as_secs_f32()));
+        ui.add_space((ui.available_height() * 0.25).min(60.0));
+        ui.vertical_centered(|ui| {
+            kit::spinner(ui, 22.0);
+            ui.add_space(space::SM);
+            ui.label(
+                RichText::new("Sending request…")
+                    .font(font::heading())
+                    .color(p.text),
+            );
+            ui.label(
+                RichText::new(format!("{:.1} s", started.elapsed().as_secs_f32()))
+                    .font(font::mono())
+                    .color(p.text_muted),
+            );
+            ui.add_space(space::SM);
+            if ui
+                .add(kit::Button::secondary("Cancel").icon(Icon::Stop).small())
+                .clicked()
+            {
+                *cancel_send = true;
+            }
         });
         ui.ctx().request_repaint_after(Duration::from_millis(100));
         return;
     }
     let Some(view) = view else {
-        ui.add_space(10.0);
-        ui.label(RichText::new("Press Send to see the response here.").weak());
+        ui.add_space((ui.available_height() * 0.22).min(56.0));
+        let send = shortcut("↵");
+        let beautify = shortcut("B");
+        kit::empty_state(
+            ui,
+            Icon::Send,
+            "No response yet",
+            "Send the request to see its response here.",
+            &[(&send, "Send request"), (&beautify, "Beautify JSON body")],
+        );
         return;
     };
     let r = match &view.result {
         Ok(r) => r,
         Err(e) => {
-            ui.add_space(6.0);
-            ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+            kit::callout(ui, p.danger, Icon::ErrorCircle, "Request failed", e);
             return;
         }
     };
@@ -1157,41 +1895,101 @@ fn response_area(
     match *tab_state {
         RespTab::Body => {
             if r.display.is_empty() {
-                ui.label(RichText::new("(empty body)").weak());
+                ui.add_space(space::LG);
+                kit::empty_state(
+                    ui,
+                    Icon::Inbox,
+                    "Empty body",
+                    "The server sent no content.",
+                    &[],
+                );
                 return;
             }
-            ui.horizontal(|ui| {
-                if ui.small_button("Copy").clicked() {
-                    ui.ctx().copy_text(r.display.clone());
-                }
-                if r.truncated {
-                    ui.label(RichText::new("Body is large; showing the first 4 MB.").weak().small());
-                }
-            });
+            if r.truncated {
+                kit::callout(
+                    ui,
+                    p.info,
+                    Icon::Alert,
+                    "Large response",
+                    "Showing the first 4 MB of the body.",
+                );
+                ui.add_space(space::SM);
+            }
             let dark = ui.visuals().dark_mode;
-            let width = ui.available_width() - 16.0;
-            let stale = !matches!(&view.galley, Some((w, d, _)) if (*w - width).abs() < 0.5 && *d == dark);
+            let width = ui.available_width() - 2.0 * space::MD - 4.0;
+            let stale =
+                !matches!(&view.galley, Some((w, d, _)) if (*w - width).abs() < 0.5 && *d == dark);
             if stale {
                 let highlight = r.is_json && r.display.len() < 2 * 1024 * 1024;
-                let mut job = json_job(&r.display, mono(ui), dark, highlight);
+                let mut job = json_job(&r.display, font::mono(), dark, highlight);
                 job.wrap.max_width = width;
                 let g = ui.fonts_mut(|f| f.layout_job(job));
                 view.galley = Some((width, dark, g));
             }
             let galley = view.galley.as_ref().unwrap().2.clone();
-            ScrollArea::vertical().id_salt("resp_body").auto_shrink([false, false]).show(ui, |ui| {
-                ui.add(Label::new(galley).selectable(true));
+            let frame = kit::card(p).show(ui, |ui| {
+                ScrollArea::vertical()
+                    .id_salt("resp_body")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(Label::new(galley).selectable(true));
+                    });
             });
+            // Copy button floats in the card's top-right corner.
+            let r_btn = Rect::from_min_size(
+                frame.response.rect.right_top() + vec2(-34.0, 8.0),
+                vec2(26.0, 26.0),
+            );
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r_btn));
+            let copy = kit::icon_button_sized(&mut child, Icon::Copy, "Copy body", 26.0);
+            if copy.clicked() {
+                ui.ctx().copy_text(r.display.clone());
+            }
         }
         RespTab::Headers => {
-            ScrollArea::vertical().id_salt("resp_headers").auto_shrink([false, false]).show(ui, |ui| {
-                egui::Grid::new("resp_headers_grid").num_columns(2).striped(true).spacing([16.0, 4.0]).show(ui, |ui| {
-                    for (k, v) in &r.headers {
-                        ui.add(Label::new(RichText::new(k).monospace().strong()).selectable(true));
-                        ui.add(Label::new(RichText::new(v).monospace()).selectable(true).wrap());
-                        ui.end_row();
-                    }
-                });
+            kit::card(p).inner_margin(Margin::same(0)).show(ui, |ui| {
+                ScrollArea::vertical()
+                    .id_salt("resp_headers")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let w = ui.available_width();
+                        let key_w = (w * 0.32).clamp(140.0, 260.0);
+                        for (i, (k, v)) in r.headers.iter().enumerate() {
+                            if i > 0 {
+                                kit::divider(ui);
+                            }
+                            Frame::new()
+                                .inner_margin(Margin::symmetric(space::MD as i8, 7))
+                                .show(ui, |ui| {
+                                    ui.horizontal_top(|ui| {
+                                        ui.allocate_ui_with_layout(
+                                            vec2(key_w, 0.0),
+                                            Layout::top_down(Align::Min),
+                                            |ui| {
+                                                ui.set_width(key_w);
+                                                ui.add(
+                                                    Label::new(
+                                                        RichText::new(k)
+                                                            .font(font::mono())
+                                                            .color(p.text_muted),
+                                                    )
+                                                    .selectable(true)
+                                                    .wrap(),
+                                                );
+                                            },
+                                        );
+                                        ui.add(
+                                            Label::new(
+                                                RichText::new(v).font(font::mono()).color(p.text),
+                                            )
+                                            .selectable(true)
+                                            .wrap(),
+                                        );
+                                    });
+                                });
+                        }
+                    });
             });
         }
         RespTab::LoadTest => {}
@@ -1207,38 +2005,100 @@ fn load_test_ui(
     start: &mut bool,
     stop: &mut bool,
 ) {
+    // One scroll area for the whole view, so it fits short windows.
+    ScrollArea::vertical()
+        .id_salt("load_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| load_test_body(ui, id, run, cfg, cache, start, stop));
+}
+
+fn load_test_body(
+    ui: &mut Ui,
+    id: u64,
+    run: Option<&loadtest::Run>,
+    cfg: &mut loadtest::Config,
+    cache: &mut Option<(Instant, u64, loadtest::Summary)>,
+    start: &mut bool,
+    stop: &mut bool,
+) {
+    let p = theme::palette(ui);
     let running = run.is_some_and(|r| r.is_running());
-    ui.add_enabled_ui(!running, |ui| {
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut cfg.mode, loadtest::Mode::Count, "Requests");
-            ui.add_enabled(cfg.mode == loadtest::Mode::Count, egui::DragValue::new(&mut cfg.total).range(1..=10_000_000).speed(5));
-            ui.add_space(8.0);
-            ui.radio_value(&mut cfg.mode, loadtest::Mode::Duration, "Duration");
-            ui.add_enabled(
-                cfg.mode == loadtest::Mode::Duration,
-                egui::DragValue::new(&mut cfg.seconds).range(1..=3600).suffix(" s"),
-            );
-            ui.add_space(16.0);
-            ui.label("Concurrency");
-            ui.add(egui::DragValue::new(&mut cfg.concurrency).range(1..=1000));
+    ui.horizontal_wrapped(|ui| {
+        ui.add_enabled_ui(!running, |ui| {
+            ui.horizontal(|ui| {
+                kit::segmented(
+                    ui,
+                    "load_mode",
+                    &mut cfg.mode,
+                    &[
+                        seg(loadtest::Mode::Count, "Requests", 0),
+                        seg(loadtest::Mode::Duration, "Duration", 0),
+                    ],
+                );
+                match cfg.mode {
+                    loadtest::Mode::Count => {
+                        ui.add_sized(
+                            [96.0, size::CONTROL],
+                            egui::DragValue::new(&mut cfg.total)
+                                .range(1..=10_000_000)
+                                .speed(5),
+                        );
+                    }
+                    loadtest::Mode::Duration => {
+                        ui.add_sized(
+                            [96.0, size::CONTROL],
+                            egui::DragValue::new(&mut cfg.seconds)
+                                .range(1..=3600)
+                                .suffix(" s"),
+                        );
+                    }
+                }
+                ui.add_space(space::SM);
+                ui.label(
+                    RichText::new("Concurrency")
+                        .font(font::body())
+                        .color(p.text_muted),
+                );
+                ui.add_sized(
+                    [72.0, size::CONTROL],
+                    egui::DragValue::new(&mut cfg.concurrency).range(1..=1000),
+                );
+            });
         });
-    });
-    ui.horizontal(|ui| {
+        ui.add_space(space::SM);
         if running {
-            if ui.button("Stop").clicked() {
+            if ui
+                .add(kit::Button::secondary("Stop").icon(Icon::Stop))
+                .clicked()
+            {
                 *stop = true;
             }
         } else if ui
-            .add(egui::Button::new(RichText::new("Start load test").color(Color32::WHITE)).fill(Color32::from_rgb(0x25, 0x63, 0xEB)))
+            .add(kit::Button::primary("Start load test").icon(Icon::Bolt))
             .clicked()
         {
             *start = true;
         }
-        ui.label(RichText::new("Sends this exact request, as configured above, from parallel workers.").weak().small());
     });
-    ui.add_space(6.0);
+    ui.add_space(space::XS);
+    ui.label(
+        RichText::new("Sends this exact request, as configured above, from parallel workers.")
+            .font(font::small())
+            .color(p.text_faint),
+    );
+    ui.add_space(space::MD);
 
-    let Some(run) = run else { return };
+    let Some(run) = run else {
+        ui.add_space(space::LG);
+        kit::empty_state(
+            ui,
+            Icon::Bolt,
+            "No load test yet",
+            "Pick a request count or duration, then start the test.",
+            &[],
+        );
+        return;
+    };
     let fresh = matches!(cache, Some((t, rid, _)) if *rid == id && t.elapsed() < Duration::from_millis(200));
     if !fresh {
         *cache = Some((Instant::now(), id, run.summary()));
@@ -1248,52 +2108,158 @@ fn load_test_ui(
         ui.ctx().request_repaint_after(Duration::from_millis(200));
     }
 
-    ui.add(egui::ProgressBar::new(s.progress).show_percentage().desired_height(14.0));
-    ui.add_space(4.0);
-    ScrollArea::vertical().id_salt("load_scroll").auto_shrink([false, false]).show(ui, |ui| {
-        ui.horizontal_top(|ui| {
-            egui::Grid::new("load_stats").num_columns(2).spacing([18.0, 3.0]).striped(true).show(ui, |ui| {
-                let row = |ui: &mut Ui, k: &str, v: String| {
-                    ui.label(RichText::new(k).weak());
-                    ui.label(RichText::new(v).monospace());
-                    ui.end_row();
-                };
-                row(ui, "Completed", s.completed.to_string());
-                row(ui, "Failed", s.failed.to_string());
-                row(ui, "Elapsed", format!("{:.2} s", s.elapsed.as_secs_f64()));
-                row(ui, "Requests/sec", format!("{:.1}", s.rps));
-                row(ui, "Data received", fmt_size(s.bytes));
-            });
-            ui.add_space(24.0);
-            egui::Grid::new("load_lat").num_columns(2).spacing([18.0, 3.0]).striped(true).show(ui, |ui| {
-                for (k, v) in [("Min", s.min), ("Average", s.avg), ("p50", s.p50), ("p90", s.p90), ("p95", s.p95), ("p99", s.p99), ("Max", s.max)] {
-                    ui.label(RichText::new(k).weak());
-                    ui.label(RichText::new(fmt_dur(v)).monospace());
-                    ui.end_row();
-                }
-            });
-            ui.add_space(24.0);
-            ui.vertical(|ui| {
-                ui.label(RichText::new("Status codes").weak());
-                if s.statuses.is_empty() {
-                    ui.label(RichText::new("none yet").weak().small());
-                }
-                for (code, n) in &s.statuses {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(code.to_string()).color(status_color(*code)).strong().monospace());
-                        ui.label(RichText::new(format!("× {n}")).monospace());
-                    });
-                }
-                if !s.errors.is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Errors").weak());
-                    for (e, n) in &s.errors {
-                        ui.label(RichText::new(format!("{n} × {e}")).color(ui.visuals().error_fg_color).small());
-                    }
-                }
-            });
+    ui.horizontal(|ui| {
+        let pct = format!("{:.0}%", s.progress * 100.0);
+        let label_w = 44.0;
+        ui.allocate_ui(vec2(ui.available_width() - label_w, 14.0), |ui| {
+            ui.add_space(4.0);
+            kit::progress(ui, s.progress, if s.running { p.accent } else { p.success });
         });
+        ui.label(
+            RichText::new(pct)
+                .font(font::small_medium())
+                .color(p.text_muted),
+        );
     });
+    ui.add_space(space::MD);
+
+    {
+        {
+            // Metric cards wrap onto more rows when the window is narrow.
+            let gap = space::SM;
+            // Leave room for the floating scrollbar.
+            let avail = ui.available_width() - 4.0;
+            let per_row = ((avail + gap) / (150.0 + gap)).floor().clamp(1.0, 5.0);
+            let card_w = ((avail - gap * (per_row - 1.0)) / per_row).floor();
+            let failed_color = (s.failed > 0).then_some(p.danger);
+            let metrics: [(&str, String, Option<Color32>); 5] = [
+                ("Requests / sec", format!("{:.1}", s.rps), None),
+                ("Completed", s.completed.to_string(), None),
+                ("Failed", s.failed.to_string(), failed_color),
+                ("Elapsed", format!("{:.2} s", s.elapsed.as_secs_f64()), None),
+                ("Data received", fmt_size(s.bytes), None),
+            ];
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(gap, gap);
+                for (label, value, color) in &metrics {
+                    kit::metric(ui, label, value, *color, card_w);
+                }
+            });
+            ui.add_space(gap);
+
+            let two_col = avail > 560.0;
+            let half = if two_col {
+                ((avail - gap) / 2.0).floor()
+            } else {
+                avail
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(gap, gap);
+                // Latency distribution with proportional bars.
+                kit::card(p).show(ui, |ui| {
+                    ui.set_width(half - 2.0 * space::MD - 2.0);
+                    ui.vertical(|ui| {
+                        kit::overline(ui, "Latency");
+                        ui.add_space(space::XS);
+                        let max = s.max.as_secs_f64().max(1e-9);
+                        for (k, v) in [
+                            ("Min", s.min),
+                            ("Average", s.avg),
+                            ("p50", s.p50),
+                            ("p90", s.p90),
+                            ("p95", s.p95),
+                            ("p99", s.p99),
+                            ("Max", s.max),
+                        ] {
+                            ui.horizontal(|ui| {
+                                ui.set_height(22.0);
+                                let w = ui.available_width();
+                                ui.allocate_ui(vec2(64.0, 22.0), |ui| {
+                                    ui.set_width(64.0);
+                                    ui.label(
+                                        RichText::new(k).font(font::small()).color(p.text_muted),
+                                    );
+                                });
+                                let bar_w = (w - 64.0 - 80.0 - 2.0 * space::SM).max(20.0);
+                                let (bar, _) =
+                                    ui.allocate_exact_size(vec2(bar_w, 6.0), Sense::hover());
+                                ui.painter()
+                                    .rect_filled(bar, CornerRadius::same(3), p.bg_active);
+                                let f = (v.as_secs_f64() / max) as f32;
+                                if f > 0.0 {
+                                    let fill = Rect::from_min_size(
+                                        bar.min,
+                                        vec2((bar.width() * f).max(4.0), bar.height()),
+                                    );
+                                    ui.painter().rect_filled(
+                                        fill,
+                                        CornerRadius::same(3),
+                                        p.accent.gamma_multiply(0.85),
+                                    );
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new(fmt_dur(v)).font(font::mono()).color(p.text),
+                                    );
+                                });
+                            });
+                        }
+                    });
+                });
+                // Status code breakdown and errors.
+                kit::card(p).show(ui, |ui| {
+                    ui.set_width(half - 2.0 * space::MD - 2.0);
+                    ui.vertical(|ui| {
+                        kit::overline(ui, "Status codes");
+                        ui.add_space(space::XS);
+                        if s.statuses.is_empty() {
+                            ui.label(
+                                RichText::new("None yet")
+                                    .font(font::small())
+                                    .color(p.text_faint),
+                            );
+                        }
+                        let total: u64 = s.statuses.iter().map(|(_, n)| *n).sum::<u64>().max(1);
+                        for (code, n) in &s.statuses {
+                            ui.horizontal(|ui| {
+                                ui.set_height(24.0);
+                                kit::badge(ui, &code.to_string(), p.status(*code));
+                                ui.label(
+                                    RichText::new(format!("{n}"))
+                                        .font(font::mono())
+                                        .color(p.text),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let pct = *n as f64 * 100.0 / total as f64;
+                                    ui.label(
+                                        RichText::new(format!("{pct:.1}%"))
+                                            .font(font::small())
+                                            .color(p.text_faint),
+                                    );
+                                });
+                            });
+                        }
+                        if !s.errors.is_empty() {
+                            ui.add_space(space::SM);
+                            kit::overline(ui, "Errors");
+                            ui.add_space(space::XS);
+                            for (e, n) in &s.errors {
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(format!("{n} × {e}"))
+                                            .font(font::small())
+                                            .color(p.danger),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        }
+                    });
+                });
+            });
+            ui.add_space(space::MD);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1302,26 +2268,7 @@ mod tests {
 
     fn test_app() -> App {
         let path = std::env::temp_dir().join(format!("kolibri-test-{}.json", std::process::id()));
-        App {
-            store: Store::starter(),
-            path,
-            dirty: false,
-            last_edit: Instant::now(),
-            notice: None,
-            agent: http::new_agent(1),
-            inflight: HashMap::new(),
-            responses: HashMap::new(),
-            loads: HashMap::new(),
-            load_cfg: loadtest::Config::default(),
-            load_cache: None,
-            req_tab: ReqTab::Params,
-            resp_tab: RespTab::Body,
-            rename: None,
-            drag: None,
-            confirm_delete: None,
-            beautify_err: None,
-            curl_err: None,
-        }
+        App::with_store(Store::starter(), path, None)
     }
 
     fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
@@ -1337,6 +2284,7 @@ mod tests {
     #[test]
     fn pasting_curl_into_url_bar_imports_it() {
         let ctx = egui::Context::default();
+        theme::install(&ctx);
         let mut app = test_app();
         frame(&ctx, &mut app, vec![]);
         ctx.memory_mut(|m| m.request_focus(Id::unique("kolibri-url-bar")));
@@ -1351,5 +2299,43 @@ mod tests {
         assert_eq!(req.method, Method::POST);
         assert_eq!(req.body, "{\"sortBy\":\"default\"}");
         assert_eq!(req.headers.len(), 3);
+    }
+
+    #[test]
+    fn every_screen_renders_in_both_themes() {
+        for dark in [true, false] {
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            ctx.set_theme(if dark {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            });
+            let mut app = test_app();
+            let id = app.store.selected.unwrap();
+            for tab in [ReqTab::Params, ReqTab::Headers, ReqTab::Body] {
+                app.req_tab = tab;
+                frame(&ctx, &mut app, vec![]);
+            }
+            app.responses.insert(
+                id,
+                ResponseView {
+                    result: Err("boom".into()),
+                    galley: None,
+                },
+            );
+            for tab in [RespTab::Body, RespTab::Headers, RespTab::LoadTest] {
+                app.resp_tab = tab;
+                frame(&ctx, &mut app, vec![]);
+            }
+            app.confirm_delete = Some(Item::Request(id));
+            app.notice = Some("notice".into());
+            frame(&ctx, &mut app, vec![]);
+            app.confirm_delete = None;
+            app.store.selected = None;
+            frame(&ctx, &mut app, vec![]);
+            app.store.folders.clear();
+            frame(&ctx, &mut app, vec![]);
+        }
     }
 }

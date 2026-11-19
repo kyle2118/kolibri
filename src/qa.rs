@@ -168,6 +168,7 @@ fn demo_store(base: &str) -> Store {
         name: "Users API".into(),
         expanded: true,
         requests: users,
+        folders: vec![],
     });
 
     let payments = vec![
@@ -190,12 +191,26 @@ fn demo_store(base: &str) -> Store {
             "http://127.0.0.1:9/settle".into(),
         ),
     ];
+    let webhooks = vec![req(
+        &mut s,
+        "Replay webhook",
+        Method::POST,
+        format!("{base}/webhooks/replay"),
+    )];
+    let sub = s.new_id();
     let fid = s.new_id();
     s.folders.push(Folder {
         id: fid,
         name: "Payments".into(),
         expanded: true,
         requests: payments,
+        folders: vec![Folder {
+            id: sub,
+            name: "Webhooks".into(),
+            expanded: true,
+            requests: webhooks,
+            folders: vec![],
+        }],
     });
 
     let health = vec![
@@ -219,6 +234,7 @@ fn demo_store(base: &str) -> Store {
         name: "Health checks".into(),
         expanded: false,
         requests: health,
+        folders: vec![],
     });
     let fid = s.new_id();
     s.folders.push(Folder {
@@ -226,6 +242,7 @@ fn demo_store(base: &str) -> Store {
         name: "Drafts".into(),
         expanded: true,
         requests: vec![],
+        folders: vec![],
     });
     s.selected = Some(s.folders[0].requests[0].id);
     s

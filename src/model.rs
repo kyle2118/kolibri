@@ -95,11 +95,53 @@ pub struct Folder {
     pub name: String,
     pub expanded: bool,
     pub requests: Vec<Request>,
+    /// Subfolders, shown above the folder's own requests.
+    pub folders: Vec<Folder>,
 }
 
 impl Default for Folder {
     fn default() -> Self {
-        Self { id: 0, name: String::new(), expanded: true, requests: Vec::new() }
+        Self {
+            id: 0,
+            name: String::new(),
+            expanded: true,
+            requests: Vec::new(),
+            folders: Vec::new(),
+        }
+    }
+}
+
+impl Folder {
+    /// Requests in this folder and all its subfolders.
+    pub fn count_requests(&self) -> usize {
+        self.requests.len() + self.folders.iter().map(Folder::count_requests).sum::<usize>()
+    }
+
+    /// Number of subfolders at any depth.
+    pub fn count_folders(&self) -> usize {
+        self.folders.len() + self.folders.iter().map(Folder::count_folders).sum::<usize>()
+    }
+
+    /// Ids of all requests in this folder and its subfolders.
+    pub fn request_ids(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        walk(std::slice::from_ref(self), &mut |f| out.extend(f.requests.iter().map(|r| r.id)));
+        out
+    }
+}
+
+/// Visit every folder, depth first, parents before children.
+fn walk<'a>(folders: &'a [Folder], f: &mut impl FnMut(&'a Folder)) {
+    for folder in folders {
+        f(folder);
+        walk(&folder.folders, f);
+    }
+}
+
+fn walk_mut(folders: &mut [Folder], f: &mut impl FnMut(&mut Folder)) {
+    for folder in folders {
+        f(folder);
+        walk_mut(&mut folder.folders, f);
     }
 }
 
@@ -135,56 +177,143 @@ impl Store {
                 params: vec![KeyValue::new("hello", "world")],
                 ..Default::default()
             }],
+            folders: Vec::new(),
         });
         s.selected = Some(rid);
         s
     }
 
     pub fn find_request(&self, id: u64) -> Option<&Request> {
-        self.folders.iter().flat_map(|f| f.requests.iter()).find(|r| r.id == id)
+        let mut found = None;
+        walk(&self.folders, &mut |f| {
+            if found.is_none() {
+                found = f.requests.iter().find(|r| r.id == id);
+            }
+        });
+        found
     }
 
     pub fn find_request_mut(&mut self, id: u64) -> Option<&mut Request> {
-        self.folders.iter_mut().flat_map(|f| f.requests.iter_mut()).find(|r| r.id == id)
+        let (fid, ri) = self.locate_request(id)?;
+        self.folder_mut(fid)?.requests.get_mut(ri)
     }
 
-    /// Returns (folder index, request index).
-    pub fn locate_request(&self, id: u64) -> Option<(usize, usize)> {
-        self.folders.iter().enumerate().find_map(|(fi, f)| {
-            f.requests.iter().position(|r| r.id == id).map(|ri| (fi, ri))
+    /// Returns (id of the folder holding the request, request index).
+    pub fn locate_request(&self, id: u64) -> Option<(u64, usize)> {
+        let mut found = None;
+        walk(&self.folders, &mut |f| {
+            if found.is_none() {
+                if let Some(ri) = f.requests.iter().position(|r| r.id == id) {
+                    found = Some((f.id, ri));
+                }
+            }
+        });
+        found
+    }
+
+    /// Child indexes leading from the top level to folder `id`.
+    pub fn folder_path(&self, id: u64) -> Option<Vec<usize>> {
+        fn find(folders: &[Folder], id: u64, path: &mut Vec<usize>) -> bool {
+            for (i, f) in folders.iter().enumerate() {
+                path.push(i);
+                if f.id == id || find(&f.folders, id, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        let mut path = Vec::new();
+        find(&self.folders, id, &mut path).then_some(path)
+    }
+
+    pub fn folder_at(&self, path: &[usize]) -> Option<&Folder> {
+        let (first, rest) = path.split_first()?;
+        rest.iter().try_fold(self.folders.get(*first)?, |f, &i| f.folders.get(i))
+    }
+
+    pub fn folder_at_mut(&mut self, path: &[usize]) -> Option<&mut Folder> {
+        let (first, rest) = path.split_first()?;
+        rest.iter().try_fold(self.folders.get_mut(*first)?, |f, &i| f.folders.get_mut(i))
+    }
+
+    pub fn folder(&self, id: u64) -> Option<&Folder> {
+        self.folder_at(&self.folder_path(id)?)
+    }
+
+    pub fn folder_mut(&mut self, id: u64) -> Option<&mut Folder> {
+        let path = self.folder_path(id)?;
+        self.folder_at_mut(&path)
+    }
+
+    /// The parent of folder `id` (`None` = top level).
+    pub fn parent_of(&self, id: u64) -> Option<Option<u64>> {
+        let path = self.folder_path(id)?;
+        Some(self.folder_at(&path[..path.len() - 1]).map(|f| f.id))
+    }
+
+    /// The list a folder lives in: top level for `None`, else a folder's subfolders.
+    pub fn children_mut(&mut self, parent: Option<u64>) -> Option<&mut Vec<Folder>> {
+        match parent {
+            None => Some(&mut self.folders),
+            Some(id) => self.folder_mut(id).map(|f| &mut f.folders),
+        }
+    }
+
+    /// Detach folder `id`; returns it with its former parent and index.
+    pub fn take_folder(&mut self, id: u64) -> Option<(Option<u64>, usize, Folder)> {
+        let path = self.folder_path(id)?;
+        let (&index, parent_path) = path.split_last()?;
+        let parent = self.folder_at(parent_path).map(|f| f.id);
+        let list = self.children_mut(parent)?;
+        Some((parent, index, list.remove(index)))
+    }
+
+    /// Is folder `id` the folder `ancestor` or somewhere inside it?
+    pub fn is_within(&self, id: u64, ancestor: u64) -> bool {
+        self.folder(ancestor).is_some_and(|a| {
+            let mut hit = a.id == id;
+            walk(&a.folders, &mut |f| hit |= f.id == id);
+            hit
         })
     }
 
-    pub fn folder_index(&self, id: u64) -> Option<usize> {
-        self.folders.iter().position(|f| f.id == id)
+    /// Names from the top-level folder down to folder `id`.
+    pub fn folder_trail(&self, id: u64) -> Vec<String> {
+        let path = self.folder_path(id).unwrap_or_default();
+        (1..=path.len())
+            .filter_map(|n| self.folder_at(&path[..n]).map(|f| f.name.clone()))
+            .collect()
+    }
+
+    /// Collapse every folder at every depth.
+    pub fn collapse_all(&mut self) {
+        walk_mut(&mut self.folders, &mut |f| f.expanded = false);
     }
 
     /// Make sure ids are unique and `next_id` is ahead of all of them
     /// (protects against hand-edited files).
     fn normalize(&mut self) {
+        // Pass 1: find the highest id, so fresh ids can't collide with any.
         let mut max = 0;
-        let mut seen = std::collections::HashSet::new();
-        let mut needs_new = Vec::new();
-        for (fi, f) in self.folders.iter().enumerate() {
-            if !seen.insert(f.id) || f.id == 0 {
-                needs_new.push((fi, None));
-            }
+        walk(&self.folders, &mut |f| {
             max = max.max(f.id);
-            for (ri, r) in f.requests.iter().enumerate() {
-                if !seen.insert(r.id) || r.id == 0 {
-                    needs_new.push((fi, Some(ri)));
-                }
-                max = max.max(r.id);
+            max = f.requests.iter().map(|r| r.id).fold(max, u64::max);
+        });
+        let mut next = self.next_id.max(max);
+        // Pass 2: re-number zero and repeated ids.
+        let mut seen = std::collections::HashSet::new();
+        let mut fix = |id: &mut u64| {
+            if *id == 0 || !seen.insert(*id) {
+                next += 1;
+                *id = next;
             }
-        }
-        self.next_id = self.next_id.max(max);
-        for (fi, ri) in needs_new {
-            let id = self.new_id();
-            match ri {
-                None => self.folders[fi].id = id,
-                Some(ri) => self.folders[fi].requests[ri].id = id,
-            }
-        }
+        };
+        walk_mut(&mut self.folders, &mut |f| {
+            fix(&mut f.id);
+            f.requests.iter_mut().for_each(|r| fix(&mut r.id));
+        });
+        self.next_id = next;
     }
 }
 
@@ -317,6 +446,45 @@ mod tests {
         // Files saved before the setting existed also open in dark mode.
         let s: Store = serde_json::from_str(r#"{"version":1,"folders":[]}"#).unwrap();
         assert!(!s.light_mode);
+    }
+
+    #[test]
+    fn old_files_load_and_nested_lookups_work() {
+        let mut s: Store = serde_json::from_str(
+            r#"{"folders":[{"id":1,"name":"A","requests":[{"id":2}]}]}"#,
+        )
+        .unwrap();
+        assert!(s.folders[0].folders.is_empty());
+        let sub = Folder { id: 3, name: "B".into(), requests: vec![Request { id: 4, ..Default::default() }], ..Default::default() };
+        s.folders[0].folders.push(sub);
+        s.folders[0].folders[0].folders.push(Folder { id: 5, ..Default::default() });
+
+        assert_eq!(s.locate_request(4), Some((3, 0)));
+        assert_eq!(s.folder_path(5), Some(vec![0, 0, 0]));
+        assert_eq!(s.parent_of(3), Some(Some(1)));
+        assert_eq!(s.parent_of(1), Some(None));
+        assert_eq!(s.folder_trail(3), ["A", "B"]);
+        assert!(s.is_within(5, 1) && s.is_within(3, 3) && !s.is_within(1, 3));
+        assert_eq!(s.folders[0].count_requests(), 2);
+        assert_eq!(s.folders[0].request_ids(), [2, 4]);
+
+        s.collapse_all();
+        assert!(!s.folders[0].expanded && !s.folder(5).unwrap().expanded);
+
+        let (parent, index, f) = s.take_folder(3).unwrap();
+        assert_eq!((parent, index, f.id), (Some(1), 0, 3));
+        assert!(s.find_request(4).is_none());
+    }
+
+    #[test]
+    fn normalize_fixes_nested_duplicate_ids() {
+        let mut s = Store::default();
+        let mut a = Folder { id: 7, ..Default::default() };
+        a.folders.push(Folder { id: 7, ..Default::default() });
+        s.folders.push(a);
+        s.normalize();
+        assert_ne!(s.folders[0].id, s.folders[0].folders[0].id);
+        assert!(s.next_id >= 8);
     }
 
     #[test]

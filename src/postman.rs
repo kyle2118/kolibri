@@ -1,8 +1,7 @@
 //! Import of Postman Collection files (format v2.0 / v2.1).
 //!
-//! Kolibri folders are flat, so the collection's top-level requests go into a
-//! folder named after the collection, and every nested Postman folder becomes
-//! its own Kolibri folder named by its path ("Collection / Users / Admin").
+//! The collection becomes one folder (named after it) and Postman folders
+//! become subfolders, keeping their nesting and order.
 //!
 //! Kolibri never substitutes variables, so collection variables
 //! (`{{baseUrl}}` etc.) are resolved once, at import time. Unknown variables
@@ -15,7 +14,8 @@ use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct Imported {
-    pub folders: Vec<Folder>,
+    /// The collection, as one top-level folder.
+    pub folder: Folder,
     pub requests: usize,
     /// Things that could not be carried over exactly.
     pub warnings: Vec<String>,
@@ -44,48 +44,43 @@ pub fn import(json: &str, store: &mut Store) -> Result<Imported, String> {
         vars: variables(root.get("variable")),
         warnings: Vec::new(),
         requests: 0,
-        folders: Vec::new(),
     };
     let auth = root.get("auth").cloned();
-    cx.walk(store, &name, items, auth.as_ref());
+    let folder = cx.walk(store, &name, items, auth.as_ref());
 
     if cx.requests == 0 {
         return Err(format!("\"{name}\" contains no requests."));
     }
     // Several requests with the same unsupported feature: say it once.
     cx.warnings.dedup();
-    Ok(Imported { folders: cx.folders, requests: cx.requests, warnings: cx.warnings })
+    Ok(Imported { folder, requests: cx.requests, warnings: cx.warnings })
 }
 
 struct Cx {
     vars: HashMap<String, String>,
     warnings: Vec<String>,
     requests: usize,
-    folders: Vec<Folder>,
 }
 
 impl Cx {
-    fn walk(&mut self, store: &mut Store, path: &str, items: &[Value], auth: Option<&Value>) {
-        let id = store.new_id();
-        let slot = self.folders.len();
-        self.folders.push(Folder { id, name: path.to_owned(), expanded: true, requests: vec![] });
-
+    fn walk(&mut self, store: &mut Store, name: &str, items: &[Value], auth: Option<&Value>) -> Folder {
+        let mut folder = Folder { id: store.new_id(), name: name.to_owned(), ..Default::default() };
         for item in items {
             let name = item.get("name").and_then(Value::as_str).unwrap_or("Untitled");
             let own_auth = item.get("auth").filter(|a| !a.is_null());
             let auth = own_auth.or(auth);
             if let Some(children) = item.get("item").and_then(Value::as_array) {
-                self.walk(store, &format!("{path} / {name}"), children, auth);
+                let mut sub = self.walk(store, name, children, auth);
+                // Imports can be large: only the collection itself starts open.
+                sub.expanded = false;
+                folder.folders.push(sub);
             } else if let Some(req) = item.get("request") {
                 let r = self.request(store.new_id(), name, req, auth);
-                self.folders[slot].requests.push(r);
+                folder.requests.push(r);
                 self.requests += 1;
             }
         }
-        // Drop folders that only held sub-folders.
-        if self.folders[slot].requests.is_empty() {
-            self.folders.remove(slot);
-        }
+        folder
     }
 
     fn sub(&self, s: &str) -> String {
@@ -452,28 +447,30 @@ mod tests {
         let mut store = Store::default();
         let out = import(SAMPLE, &mut store).unwrap();
         assert_eq!(out.requests, 3);
-        let names: Vec<_> = out.folders.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["Demo API", "Demo API / Users", "Demo API / Users / Admin"]);
+        let root = &out.folder;
+        assert_eq!(root.name, "Demo API");
+        assert_eq!(root.folders[0].name, "Users");
+        assert_eq!(root.folders[0].folders[0].name, "Admin");
 
-        let health = &out.folders[0].requests[0];
+        let health = &root.requests[0];
         assert_eq!(health.url, "https://api.example.com/health?verbose=1");
         assert_eq!(health.params.len(), 2);
         assert!(!health.params[1].enabled);
         assert_eq!(health.headers[0], KeyValue::new("Authorization", "Bearer secret"));
 
-        let create = &out.folders[1].requests[0];
+        let create = &root.folders[0].requests[0];
         assert_eq!(create.method, Method::POST);
         assert_eq!(create.body_kind, BodyKind::Json);
         assert_eq!(create.body, "{\"name\": \"{{unknown}}\"}");
         assert!(!create.headers[0].enabled);
 
-        let login = &out.folders[2].requests[0];
+        let login = &root.folders[0].folders[0].requests[0];
         assert_eq!(login.url, "https://example.com/login");
         assert_eq!(login.headers[0], KeyValue::new("Authorization", "Basic YTpi"));
         assert_eq!(login.body, "x=1");
 
-        let mut ids: Vec<u64> = out.folders.iter().map(|f| f.id).collect();
-        ids.extend(out.folders.iter().flat_map(|f| f.requests.iter().map(|r| r.id)));
+        let mut ids = vec![root.id, root.folders[0].id, root.folders[0].folders[0].id];
+        ids.extend(root.request_ids());
         let n = ids.len();
         ids.sort();
         ids.dedup();

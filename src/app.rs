@@ -43,18 +43,31 @@ enum RespTab {
 
 #[derive(Clone, Copy, Debug)]
 enum DropTarget {
-    /// Insert the dragged folder before folder index `.0` (== len: at end).
-    FolderAt(usize),
+    /// Insert the dragged folder into `parent` (`None` = top level) before `index`.
+    FolderAt { parent: Option<u64>, index: usize },
     /// Insert the dragged request into folder `folder` before `index`.
-    RequestAt { folder: usize, index: usize },
-    /// Append the dragged request to the end of folder `.0`.
-    IntoFolder(usize),
+    RequestAt { folder: u64, index: usize },
+    /// Append the dragged request, or nest the dragged folder, in folder `.0`.
+    IntoFolder(u64),
 }
 
+/// A visible sidebar row, for drag-and-drop hit testing.
 #[derive(Clone, Copy)]
 enum RowRef {
-    Folder(usize),
-    Request(usize, usize),
+    Folder { id: u64, parent: Option<u64>, index: usize },
+    Request { folder: u64, index: usize },
+}
+
+/// Left padding added per nesting level in the sidebar.
+const INDENT: f32 = 14.0;
+
+/// What the sidebar tree collects while drawing.
+#[derive(Default)]
+struct TreeOut {
+    rows: Vec<(Rect, RowRef)>,
+    actions: Vec<Action>,
+    commit: bool,
+    cancel: bool,
 }
 
 struct Rename {
@@ -73,7 +86,9 @@ enum Action {
     Toggle(u64),
     StartRename(Item),
     NewRequest(u64),
-    NewFolder,
+    /// New folder inside the given folder (`None` = top level).
+    NewFolder(Option<u64>),
+    CollapseAll,
     ImportPostman,
     Duplicate(u64),
     AskDelete(Item),
@@ -222,8 +237,8 @@ impl App {
     fn apply_import(&mut self, result: Result<postman::Imported, String>) {
         match result {
             Ok(imported) => {
-                let first = imported.folders.first().and_then(|f| f.requests.first()).map(|r| r.id);
-                self.store.folders.extend(imported.folders);
+                let first = imported.folder.requests.first().map(|r| r.id);
+                self.store.folders.push(imported.folder);
                 if first.is_some() {
                     self.store.selected = first;
                 }
@@ -317,17 +332,18 @@ impl App {
                 self.touch();
             }
             Action::Toggle(fid) => {
-                if let Some(fi) = self.store.folder_index(fid) {
-                    self.store.folders[fi].expanded ^= true;
+                if let Some(f) = self.store.folder_mut(fid) {
+                    f.expanded ^= true;
                     self.touch();
                 }
             }
+            Action::CollapseAll => {
+                self.store.collapse_all();
+                self.touch();
+            }
             Action::StartRename(item) => {
                 let text = match item {
-                    Item::Folder(id) => self
-                        .store
-                        .folder_index(id)
-                        .map(|i| self.store.folders[i].name.clone()),
+                    Item::Folder(id) => self.store.folder(id).map(|f| f.name.clone()),
                     Item::Request(id) => self.store.find_request(id).map(|r| r.name.clone()),
                 };
                 if let Some(text) = text {
@@ -338,13 +354,20 @@ impl App {
                     });
                 }
             }
-            Action::NewFolder => {
+            Action::NewFolder(parent) => {
                 let id = self.store.new_id();
-                self.store.folders.push(Folder {
+                let folder = Folder {
                     id,
                     name: "New folder".into(),
                     ..Default::default()
-                });
+                };
+                match parent.and_then(|pid| self.store.folder_mut(pid)) {
+                    Some(p) => {
+                        p.expanded = true;
+                        p.folders.push(folder);
+                    }
+                    None => self.store.folders.push(folder),
+                }
                 self.rename = Some(Rename {
                     item: Item::Folder(id),
                     text: "New folder".into(),
@@ -354,11 +377,10 @@ impl App {
             }
             Action::ImportPostman => self.import_postman(),
             Action::NewRequest(fid) => {
-                let Some(fi) = self.store.folder_index(fid) else {
+                let id = self.store.new_id();
+                let Some(f) = self.store.folder_mut(fid) else {
                     return;
                 };
-                let id = self.store.new_id();
-                let f = &mut self.store.folders[fi];
                 f.expanded = true;
                 f.requests.push(Request {
                     id,
@@ -374,14 +396,17 @@ impl App {
                 self.touch();
             }
             Action::Duplicate(rid) => {
-                let Some((fi, ri)) = self.store.locate_request(rid) else {
+                let Some((fid, ri)) = self.store.locate_request(rid) else {
                     return;
                 };
                 let id = self.store.new_id();
-                let mut copy = self.store.folders[fi].requests[ri].clone();
+                let Some(f) = self.store.folder_mut(fid) else {
+                    return;
+                };
+                let mut copy = f.requests[ri].clone();
                 copy.id = id;
                 copy.name.push_str(" copy");
-                self.store.folders[fi].requests.insert(ri + 1, copy);
+                f.requests.insert(ri + 1, copy);
                 self.store.selected = Some(id);
                 self.touch();
             }
@@ -397,8 +422,8 @@ impl App {
         }
         match r.item {
             Item::Folder(id) => {
-                if let Some(i) = self.store.folder_index(id) {
-                    self.store.folders[i].name = name;
+                if let Some(f) = self.store.folder_mut(id) {
+                    f.name = name;
                 }
             }
             Item::Request(id) => {
@@ -413,20 +438,21 @@ impl App {
     fn delete(&mut self, item: Item) {
         match item {
             Item::Folder(id) => {
-                if let Some(i) = self.store.folder_index(id) {
-                    let f = self.store.folders.remove(i);
-                    for r in &f.requests {
-                        self.responses.remove(&r.id);
-                        self.loads.remove(&r.id);
-                        if self.store.selected == Some(r.id) {
+                if let Some((_, _, f)) = self.store.take_folder(id) {
+                    for rid in f.request_ids() {
+                        self.responses.remove(&rid);
+                        self.loads.remove(&rid);
+                        if self.store.selected == Some(rid) {
                             self.store.selected = None;
                         }
                     }
                 }
             }
             Item::Request(id) => {
-                if let Some((fi, ri)) = self.store.locate_request(id) {
-                    self.store.folders[fi].requests.remove(ri);
+                if let Some((fid, ri)) = self.store.locate_request(id) {
+                    if let Some(f) = self.store.folder_mut(fid) {
+                        f.requests.remove(ri);
+                    }
                     self.responses.remove(&id);
                     self.loads.remove(&id);
                     if self.store.selected == Some(id) {
@@ -440,20 +466,35 @@ impl App {
 
     fn apply_drop(&mut self, item: Item, target: DropTarget) {
         match (item, target) {
-            (Item::Folder(id), DropTarget::FolderAt(mut to)) => {
-                let Some(from) = self.store.folder_index(id) else {
+            (Item::Folder(id), DropTarget::FolderAt { parent, mut index }) => {
+                // Never into itself or one of its own subfolders.
+                if parent.is_some_and(|p| self.store.is_within(p, id)) {
+                    return;
+                }
+                let Some((from_parent, from, folder)) = self.store.take_folder(id) else {
                     return;
                 };
-                if to > from {
-                    to -= 1;
+                if from_parent == parent && index > from {
+                    index -= 1;
                 }
-                if to != from {
-                    let f = self.store.folders.remove(from);
-                    self.store
-                        .folders
-                        .insert(to.min(self.store.folders.len()), f);
+                let moved = from_parent != parent || index != from;
+                let list = self.store.children_mut(parent).expect("parent checked above");
+                list.insert(index.min(list.len()), folder);
+                if moved {
                     self.touch();
                 }
+            }
+            (Item::Folder(id), DropTarget::IntoFolder(dest)) => {
+                if self.store.is_within(dest, id) || self.store.parent_of(id) == Some(Some(dest)) {
+                    return;
+                }
+                let Some((_, _, folder)) = self.store.take_folder(id) else {
+                    return;
+                };
+                let d = self.store.folder_mut(dest).expect("dest is outside the moved folder");
+                d.expanded = true;
+                d.folders.push(folder);
+                self.touch();
             }
             (Item::Request(id), DropTarget::RequestAt { folder, mut index }) => {
                 let Some((sf, si)) = self.store.locate_request(id) else {
@@ -462,11 +503,14 @@ impl App {
                 if sf == folder && (index == si || index == si + 1) {
                     return;
                 }
-                let r = self.store.folders[sf].requests.remove(si);
+                if self.store.folder(folder).is_none() {
+                    return;
+                }
+                let r = self.store.folder_mut(sf).unwrap().requests.remove(si);
                 if sf == folder && index > si {
                     index -= 1;
                 }
-                let dest = &mut self.store.folders[folder];
+                let dest = self.store.folder_mut(folder).unwrap();
                 dest.expanded = true;
                 dest.requests.insert(index.min(dest.requests.len()), r);
                 self.touch();
@@ -475,11 +519,11 @@ impl App {
                 let Some((sf, si)) = self.store.locate_request(id) else {
                     return;
                 };
-                if sf == folder {
+                if sf == folder || self.store.folder(folder).is_none() {
                     return;
                 }
-                let r = self.store.folders[sf].requests.remove(si);
-                let dest = &mut self.store.folders[folder];
+                let r = self.store.folder_mut(sf).unwrap().requests.remove(si);
+                let dest = self.store.folder_mut(folder).unwrap();
                 dest.expanded = true;
                 dest.requests.push(r);
                 self.touch();
@@ -492,9 +536,9 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut Ui) {
         let p = theme::palette(ui);
-        let mut actions = Vec::new();
+        let mut out = TreeOut::default();
 
-        // Brand + primary sidebar action.
+        // Brand + primary sidebar actions.
         ui.horizontal(|ui| {
             ui.set_height(size::CONTROL);
             ui.spacing_mut().item_spacing.x = space::SM;
@@ -504,23 +548,27 @@ impl App {
             ui.label(RichText::new("Kolibri").font(font::title()).color(p.text));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if kit::icon_button(ui, Icon::FolderPlus, "New folder").clicked() {
-                    actions.push(Action::NewFolder);
+                    out.actions.push(Action::NewFolder(None));
                 }
                 if kit::icon_button(ui, Icon::Import, "Import Postman collection").clicked() {
-                    actions.push(Action::ImportPostman);
+                    out.actions.push(Action::ImportPostman);
                 }
             });
         });
         ui.add_space(space::MD);
         ui.horizontal(|ui| {
+            ui.set_height(size::CONTROL_SM);
             ui.add_space(space::SM);
             kit::overline(ui, "Collections");
+            if !self.store.folders.is_empty() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if kit::icon_button(ui, Icon::CollapseAll, "Collapse all folders").clicked() {
+                        out.actions.push(Action::CollapseAll);
+                    }
+                });
+            }
         });
         ui.add_space(space::XS);
-
-        let mut rows: Vec<(Rect, RowRef)> = Vec::new();
-        let mut commit = false;
-        let mut cancel = false;
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -541,150 +589,177 @@ impl App {
                             .add(kit::Button::secondary("New folder").icon(Icon::FolderPlus))
                             .clicked()
                         {
-                            actions.push(Action::NewFolder);
+                            out.actions.push(Action::NewFolder(None));
                         }
                     });
                 }
+                let mut path = Vec::new();
                 for fi in 0..self.store.folders.len() {
-                    let folder = &self.store.folders[fi];
-                    let fid = folder.id;
-                    let renaming = matches!(&self.rename, Some(r) if r.item == Item::Folder(fid));
-                    if renaming {
-                        let (rect, c, x) = rename_row(ui, self.rename.as_mut().unwrap(), 26.0);
-                        commit |= c;
-                        cancel |= x;
-                        rows.push((rect, RowRef::Folder(fi)));
-                    } else {
-                        let dragging_this = self.drag == Some(Item::Folder(fid));
-                        let resp = folder_row(ui, folder, dragging_this);
-                        rows.push((resp.rect, RowRef::Folder(fi)));
-                        let plus = Rect::from_min_size(
-                            pos2(resp.rect.right() - 28.0, resp.rect.top()),
-                            vec2(28.0, resp.rect.height()),
-                        );
-                        if resp.clicked() {
-                            let on_plus = resp
-                                .interact_pointer_pos()
-                                .is_some_and(|p| plus.contains(p));
-                            actions.push(if on_plus {
-                                Action::NewRequest(fid)
-                            } else {
-                                Action::Toggle(fid)
-                            });
-                        }
-                        if resp.double_clicked() {
-                            actions.push(Action::StartRename(Item::Folder(fid)));
-                        }
-                        if resp.drag_started() {
-                            self.drag = Some(Item::Folder(fid));
-                        }
-                        resp.context_menu(|ui| {
-                            if kit::menu_item(ui, Some(Icon::Plus), "New request", false).clicked()
-                            {
-                                actions.push(Action::NewRequest(fid));
-                                ui.close();
-                            }
-                            if kit::menu_item(ui, Some(Icon::Pencil), "Rename", false).clicked() {
-                                actions.push(Action::StartRename(Item::Folder(fid)));
-                                ui.close();
-                            }
-                            kit::menu_separator(ui);
-                            if kit::menu_item(ui, Some(Icon::Trash), "Delete folder", true)
-                                .clicked()
-                            {
-                                actions.push(Action::AskDelete(Item::Folder(fid)));
-                                ui.close();
-                            }
-                        });
-                    }
-
-                    let folder = &self.store.folders[fi];
-                    if !folder.expanded {
-                        continue;
-                    }
-                    if folder.requests.is_empty() {
-                        let (rect, _) = ui.allocate_exact_size(
-                            vec2(ui.available_width(), size::ROW),
-                            Sense::hover(),
-                        );
-                        ui.painter().text(
-                            pos2(rect.left() + 34.0, rect.center().y),
-                            Align2::LEFT_CENTER,
-                            "No requests yet",
-                            font::small(),
-                            p.text_faint,
-                        );
-                    }
-                    for ri in 0..folder.requests.len() {
-                        let req = &self.store.folders[fi].requests[ri];
-                        let rid = req.id;
-                        let renaming =
-                            matches!(&self.rename, Some(r) if r.item == Item::Request(rid));
-                        if renaming {
-                            let (rect, c, x) = rename_row(ui, self.rename.as_mut().unwrap(), 30.0);
-                            commit |= c;
-                            cancel |= x;
-                            rows.push((rect, RowRef::Request(fi, ri)));
-                            continue;
-                        }
-                        let selected = self.store.selected == Some(rid);
-                        let busy = self.inflight.contains_key(&rid)
-                            || self.loads.get(&rid).is_some_and(|l| l.is_running());
-                        let resp = request_row(
-                            ui,
-                            req,
-                            selected,
-                            busy,
-                            self.drag == Some(Item::Request(rid)),
-                        );
-                        rows.push((resp.rect, RowRef::Request(fi, ri)));
-                        #[cfg(feature = "qa")]
-                        if fi == 0 && ri == 0 {
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(Id::unique("qa_first_request_row"), resp.rect)
-                            });
-                        }
-                        if resp.clicked() {
-                            actions.push(Action::Select(rid));
-                        }
-                        if resp.double_clicked() {
-                            actions.push(Action::StartRename(Item::Request(rid)));
-                        }
-                        if resp.drag_started() {
-                            self.drag = Some(Item::Request(rid));
-                        }
-                        resp.context_menu(|ui| {
-                            if kit::menu_item(ui, Some(Icon::Pencil), "Rename", false).clicked() {
-                                actions.push(Action::StartRename(Item::Request(rid)));
-                                ui.close();
-                            }
-                            if kit::menu_item(ui, Some(Icon::Copy), "Duplicate", false).clicked() {
-                                actions.push(Action::Duplicate(rid));
-                                ui.close();
-                            }
-                            kit::menu_separator(ui);
-                            if kit::menu_item(ui, Some(Icon::Trash), "Delete request", true)
-                                .clicked()
-                            {
-                                actions.push(Action::AskDelete(Item::Request(rid)));
-                                ui.close();
-                            }
-                        });
-                    }
-                    ui.add_space(space::XS);
+                    path.push(fi);
+                    self.folder_tree(ui, &mut path, None, &mut out);
+                    path.pop();
                 }
                 ui.add_space(40.0);
             });
 
-        if cancel {
+        if out.cancel {
             self.rename = None;
-        } else if commit {
+        } else if out.commit {
             self.commit_rename();
         }
-        for a in actions {
+        for a in out.actions {
             self.apply(a);
         }
-        self.handle_drag(ui, &rows);
+        self.handle_drag(ui, &out.rows);
+    }
+
+    /// Draw the folder at `path` (child indexes from the top level), then,
+    /// if it is open, its subfolders and requests.
+    fn folder_tree(
+        &mut self,
+        ui: &mut Ui,
+        path: &mut Vec<usize>,
+        parent: Option<u64>,
+        out: &mut TreeOut,
+    ) {
+        let p = theme::palette(ui);
+        let index = *path.last().expect("path is never empty");
+        let indent = (path.len() - 1) as f32 * INDENT;
+        let Some(folder) = self.store.folder_at(path) else {
+            return;
+        };
+        let fid = folder.id;
+        let row = RowRef::Folder { id: fid, parent, index };
+
+        let renaming = matches!(&self.rename, Some(r) if r.item == Item::Folder(fid));
+        if renaming {
+            let (rect, c, x) = rename_row(ui, self.rename.as_mut().unwrap(), 26.0 + indent);
+            out.commit |= c;
+            out.cancel |= x;
+            out.rows.push((rect, row));
+        } else {
+            let dragging_this = self.drag == Some(Item::Folder(fid));
+            let resp = folder_row(ui, folder, indent, dragging_this);
+            out.rows.push((resp.rect, row));
+            if resp.clicked() {
+                let (plus, sub) = folder_row_buttons(resp.rect);
+                let at = resp.interact_pointer_pos();
+                out.actions.push(if at.is_some_and(|p| plus.contains(p)) {
+                    Action::NewRequest(fid)
+                } else if at.is_some_and(|p| sub.contains(p)) {
+                    Action::NewFolder(Some(fid))
+                } else {
+                    Action::Toggle(fid)
+                });
+            }
+            if resp.double_clicked() {
+                out.actions.push(Action::StartRename(Item::Folder(fid)));
+            }
+            if resp.drag_started() {
+                self.drag = Some(Item::Folder(fid));
+            }
+            resp.context_menu(|ui| {
+                if kit::menu_item(ui, Some(Icon::Plus), "New request", false).clicked() {
+                    out.actions.push(Action::NewRequest(fid));
+                    ui.close();
+                }
+                if kit::menu_item(ui, Some(Icon::FolderPlus), "New subfolder", false).clicked() {
+                    out.actions.push(Action::NewFolder(Some(fid)));
+                    ui.close();
+                }
+                if kit::menu_item(ui, Some(Icon::Pencil), "Rename", false).clicked() {
+                    out.actions.push(Action::StartRename(Item::Folder(fid)));
+                    ui.close();
+                }
+                kit::menu_separator(ui);
+                if kit::menu_item(ui, Some(Icon::Trash), "Delete folder", true).clicked() {
+                    out.actions.push(Action::AskDelete(Item::Folder(fid)));
+                    ui.close();
+                }
+            });
+        }
+
+        let folder = self.store.folder_at(path).unwrap();
+        if !folder.expanded {
+            return;
+        }
+        for i in 0..folder.folders.len() {
+            path.push(i);
+            self.folder_tree(ui, path, Some(fid), out);
+            path.pop();
+        }
+
+        let folder = self.store.folder_at(path).unwrap();
+        if folder.requests.is_empty() && folder.folders.is_empty() {
+            let (rect, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), size::ROW), Sense::hover());
+            ui.painter().text(
+                pos2(rect.left() + 34.0 + indent, rect.center().y),
+                Align2::LEFT_CENTER,
+                "No requests yet",
+                font::small(),
+                p.text_faint,
+            );
+        }
+        for ri in 0..folder.requests.len() {
+            let req = &self.store.folder_at(path).unwrap().requests[ri];
+            let rid = req.id;
+            let row = RowRef::Request { folder: fid, index: ri };
+            let renaming = matches!(&self.rename, Some(r) if r.item == Item::Request(rid));
+            if renaming {
+                let (rect, c, x) =
+                    rename_row(ui, self.rename.as_mut().unwrap(), 30.0 + indent);
+                out.commit |= c;
+                out.cancel |= x;
+                out.rows.push((rect, row));
+                continue;
+            }
+            let selected = self.store.selected == Some(rid);
+            let busy = self.inflight.contains_key(&rid)
+                || self.loads.get(&rid).is_some_and(|l| l.is_running());
+            let resp = request_row(
+                ui,
+                req,
+                indent,
+                selected,
+                busy,
+                self.drag == Some(Item::Request(rid)),
+            );
+            out.rows.push((resp.rect, row));
+            #[cfg(feature = "qa")]
+            if path.as_slice() == [0] && ri == 0 {
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(Id::unique("qa_first_request_row"), resp.rect)
+                });
+            }
+            if resp.clicked() {
+                out.actions.push(Action::Select(rid));
+            }
+            if resp.double_clicked() {
+                out.actions.push(Action::StartRename(Item::Request(rid)));
+            }
+            if resp.drag_started() {
+                self.drag = Some(Item::Request(rid));
+            }
+            resp.context_menu(|ui| {
+                if kit::menu_item(ui, Some(Icon::Pencil), "Rename", false).clicked() {
+                    out.actions.push(Action::StartRename(Item::Request(rid)));
+                    ui.close();
+                }
+                if kit::menu_item(ui, Some(Icon::Copy), "Duplicate", false).clicked() {
+                    out.actions.push(Action::Duplicate(rid));
+                    ui.close();
+                }
+                kit::menu_separator(ui);
+                if kit::menu_item(ui, Some(Icon::Trash), "Delete request", true).clicked() {
+                    out.actions.push(Action::AskDelete(Item::Request(rid)));
+                    ui.close();
+                }
+            });
+        }
+        if path.len() == 1 {
+            ui.add_space(space::XS);
+        }
     }
 
     fn handle_drag(&mut self, ui: &mut Ui, rows: &[(Rect, RowRef)]) {
@@ -714,70 +789,69 @@ impl App {
         let x1 = rows.first().map(|r| r.0.right()).unwrap_or(0.0);
 
         let mut target = None;
+        let hit = rows
+            .iter()
+            .find(|(r, _)| pos.y >= r.top() - 1.0 && pos.y <= r.bottom() + 1.0);
+        let into = |rect: &Rect| {
+            painter.rect(
+                *rect,
+                CornerRadius::same(radius::MD),
+                p.tint(accent),
+                Stroke::new(1.0, accent),
+                StrokeKind::Inside,
+            );
+        };
         match item {
-            Item::Folder(_) => {
-                // A folder "block" is its header plus its visible requests.
-                let mut blocks: Vec<Rect> = Vec::new();
-                for (rect, r) in rows {
-                    match r {
-                        RowRef::Folder(_) => blocks.push(*rect),
-                        RowRef::Request(..) => {
-                            if let Some(b) = blocks.last_mut() {
-                                *b = b.union(*rect);
-                            }
-                        }
+            Item::Folder(dragged) => match hit {
+                // Not onto itself or anything inside it.
+                Some((_, RowRef::Folder { id, .. })) if self.store.is_within(*id, dragged) => {}
+                Some((rect, RowRef::Folder { id, parent, index })) => {
+                    // Top edge: place before this folder; rest of the row: nest inside it.
+                    if pos.y < rect.top() + rect.height() * 0.3 {
+                        line(rect.top() - 1.0, rect.left() + 4.0, rect.right() - 4.0);
+                        target = Some(DropTarget::FolderAt { parent: *parent, index: *index });
+                    } else {
+                        into(rect);
+                        target = Some(DropTarget::IntoFolder(*id));
                     }
                 }
-                if !blocks.is_empty() {
-                    let idx = blocks.iter().filter(|b| b.center().y < pos.y).count();
-                    let y = if idx < blocks.len() {
-                        blocks[idx].top() - 1.0
-                    } else {
-                        blocks[idx - 1].bottom() + 1.0
-                    };
-                    line(y, x0 + 4.0, x1 - 4.0);
-                    target = Some(DropTarget::FolderAt(idx));
-                }
-            }
-            Item::Request(_) => {
-                let hit = rows
-                    .iter()
-                    .find(|(r, _)| pos.y >= r.top() - 1.0 && pos.y <= r.bottom() + 1.0);
-                match hit {
-                    Some((rect, RowRef::Request(fi, ri))) => {
-                        let before = pos.y < rect.center().y;
-                        let y = if before {
-                            rect.top() - 1.0
-                        } else {
-                            rect.bottom() + 1.0
-                        };
-                        line(y, rect.left() + 28.0, rect.right() - 4.0);
-                        target = Some(DropTarget::RequestAt {
-                            folder: *fi,
-                            index: if before { *ri } else { ri + 1 },
+                Some(_) => {}
+                None => {
+                    // Below everything: move to the end of the top level.
+                    if let Some(last) = rows.last().filter(|(r, _)| pos.y > r.bottom()) {
+                        line(last.0.bottom() + 1.0, x0 + 4.0, x1 - 4.0);
+                        target = Some(DropTarget::FolderAt {
+                            parent: None,
+                            index: self.store.folders.len(),
                         });
                     }
-                    Some((rect, RowRef::Folder(fi))) => {
-                        painter.rect(
-                            *rect,
-                            CornerRadius::same(radius::MD),
-                            p.tint(accent),
-                            Stroke::new(1.0, accent),
-                            StrokeKind::Inside,
-                        );
-                        target = Some(DropTarget::IntoFolder(*fi));
-                    }
-                    None => {}
                 }
-            }
+            },
+            Item::Request(_) => match hit {
+                Some((rect, RowRef::Request { folder, index })) => {
+                    let before = pos.y < rect.center().y;
+                    let y = if before {
+                        rect.top() - 1.0
+                    } else {
+                        rect.bottom() + 1.0
+                    };
+                    line(y, rect.left() + 28.0, rect.right() - 4.0);
+                    target = Some(DropTarget::RequestAt {
+                        folder: *folder,
+                        index: if before { *index } else { index + 1 },
+                    });
+                }
+                Some((rect, RowRef::Folder { id, .. })) => {
+                    into(rect);
+                    target = Some(DropTarget::IntoFolder(*id));
+                }
+                None => {}
+            },
         }
 
         // Floating chip under the cursor.
         let label = match item {
-            Item::Folder(id) => self
-                .store
-                .folder_index(id)
-                .map(|i| self.store.folders[i].name.clone()),
+            Item::Folder(id) => self.store.folder(id).map(|f| f.name.clone()),
             Item::Request(id) => self.store.find_request(id).map(|r| r.name.clone()),
         };
         if let Some(label) = label {
@@ -837,8 +911,8 @@ impl App {
         let mut changed = false;
         let busy = self.inflight.contains_key(&id);
 
-        let (fi, _) = self.store.locate_request(id).unwrap();
-        let folder_name = self.store.folders[fi].name.clone();
+        let (fid, _) = self.store.locate_request(id).unwrap();
+        let folder_name = self.store.folder_trail(fid).join(" / ");
         let mut dark = !self.store.light_mode;
         let mut theme_changed = false;
         let req = self.store.find_request_mut(id).unwrap();
@@ -1305,7 +1379,7 @@ impl App {
                         .add(kit::Button::secondary("New folder").icon(Icon::FolderPlus))
                         .clicked()
                     {
-                        action = Some(Action::NewFolder);
+                        action = Some(Action::NewFolder(None));
                     }
                 });
             });
@@ -1321,18 +1395,27 @@ impl App {
         };
         let p = theme::palette_for(ctx.global_style().visuals.dark_mode);
         let (title, detail) = match item {
-            Item::Folder(id) => match self.store.folder_index(id) {
-                Some(i) => {
-                    let f = &self.store.folders[i];
-                    let n = f.requests.len();
+            Item::Folder(id) => match self.store.folder(id) {
+                Some(f) => {
+                    let plural = |n: usize, what: &str| {
+                        format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+                    };
+                    let contents: Vec<String> = [
+                        (f.count_folders(), "subfolder"),
+                        (f.count_requests(), "request"),
+                    ]
+                    .into_iter()
+                    .filter(|(n, _)| *n > 0)
+                    .map(|(n, w)| plural(n, w))
+                    .collect();
                     (
                         format!("Delete folder “{}”?", f.name),
-                        if n == 0 {
+                        if contents.is_empty() {
                             "The folder is empty. This can't be undone.".to_owned()
                         } else {
                             format!(
-                                "This also deletes its {n} request{}. This can't be undone.",
-                                if n == 1 { "" } else { "s" }
+                                "This also deletes its {}. This can't be undone.",
+                                contents.join(" and ")
                             )
                         },
                     )
@@ -1549,7 +1632,17 @@ fn row_bg(ui: &Ui, rect: Rect, p: &Palette, selected: bool, hovered: bool) {
     }
 }
 
-fn folder_row(ui: &mut Ui, folder: &Folder, dragging: bool) -> egui::Response {
+/// Hover buttons on a folder row: (new request "+", new subfolder).
+fn folder_row_buttons(rect: Rect) -> (Rect, Rect) {
+    let plus = Rect::from_min_max(pos2(rect.right() - 28.0, rect.top()), rect.max);
+    let sub = Rect::from_min_max(
+        pos2(rect.right() - 54.0, rect.top()),
+        pos2(rect.right() - 28.0, rect.bottom()),
+    );
+    (plus, sub)
+}
+
+fn folder_row(ui: &mut Ui, folder: &Folder, indent: f32, dragging: bool) -> egui::Response {
     let p = theme::palette(ui);
     let (rect, resp) = ui.allocate_exact_size(
         vec2(ui.available_width(), size::ROW),
@@ -1559,6 +1652,7 @@ fn folder_row(ui: &mut Ui, folder: &Folder, dragging: bool) -> egui::Response {
     row_bg(ui, rect, p, false, hovered);
     let painter = ui.painter();
     let cy = rect.center().y;
+    let left = rect.left() + indent;
     let chevron = if folder.expanded {
         Icon::ChevronDown
     } else {
@@ -1566,55 +1660,63 @@ fn folder_row(ui: &mut Ui, folder: &Folder, dragging: bool) -> egui::Response {
     };
     kit::paint_icon(
         painter,
-        Rect::from_center_size(pos2(rect.left() + 11.0, cy), vec2(11.0, 11.0)),
+        Rect::from_center_size(pos2(left + 11.0, cy), vec2(11.0, 11.0)),
         chevron,
         p.text_faint,
     );
     kit::paint_icon(
         painter,
-        Rect::from_center_size(pos2(rect.left() + 28.0, cy), vec2(14.0, 14.0)),
+        Rect::from_center_size(pos2(left + 28.0, cy), vec2(14.0, 14.0)),
         Icon::Folder,
         p.text_muted,
     );
 
     let color = if dragging { p.text_faint } else { p.text };
-    let right_reserved = 34.0;
+    let right_reserved = if hovered { 58.0 } else { 34.0 };
     kit::paint_text_clipped(
         ui,
-        pos2(rect.left() + 42.0, cy),
+        pos2(left + 42.0, cy),
         Align2::LEFT_CENTER,
         &folder.name,
         font::label(),
         color,
-        rect.width() - 42.0 - right_reserved,
+        rect.right() - left - 42.0 - right_reserved,
     );
 
-    if resp.hovered() && !dragging {
-        let r = Rect::from_center_size(pos2(rect.right() - 14.0, cy), vec2(22.0, 22.0));
-        let on = resp.hover_pos().is_some_and(|h| r.expand(3.0).contains(h));
-        if on {
-            ui.painter()
-                .rect_filled(r, CornerRadius::same(radius::SM), p.bg_active);
+    let mut tip = None;
+    if hovered {
+        let (plus, sub) = folder_row_buttons(rect);
+        let hover = resp.hover_pos();
+        for (zone, icon, size, text) in [
+            (plus, Icon::Plus, 13.0, "New request"),
+            (sub, Icon::FolderPlus, 14.0, "New subfolder"),
+        ] {
+            let r = Rect::from_center_size(zone.center(), vec2(22.0, 22.0));
+            let on = hover.is_some_and(|h| zone.contains(h));
+            if on {
+                ui.painter()
+                    .rect_filled(r, CornerRadius::same(radius::SM), p.bg_active);
+                tip = Some(text);
+            }
+            kit::paint_icon(
+                ui.painter(),
+                Rect::from_center_size(r.center(), vec2(size, size)),
+                icon,
+                if on { p.text } else { p.text_muted },
+            );
         }
-        kit::paint_icon(
-            ui.painter(),
-            Rect::from_center_size(r.center(), vec2(13.0, 13.0)),
-            Icon::Plus,
-            if on { p.text } else { p.text_muted },
-        );
     } else {
         ui.painter().text(
             pos2(rect.right() - 10.0, cy),
             Align2::RIGHT_CENTER,
-            folder.requests.len().to_string(),
+            folder.count_requests().to_string(),
             font::small(),
             p.text_faint,
         );
     }
-    let resp = if resp.hovered() {
-        resp.on_hover_text_at_pointer("Click + to add a request")
-    } else {
-        resp
+    let resp = match tip {
+        Some(t) => resp.on_hover_text_at_pointer(t),
+        None => resp,
     };
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
@@ -1622,6 +1724,7 @@ fn folder_row(ui: &mut Ui, folder: &Folder, dragging: bool) -> egui::Response {
 fn request_row(
     ui: &mut Ui,
     req: &Request,
+    indent: f32,
     selected: bool,
     busy: bool,
     dragging: bool,
@@ -1639,7 +1742,7 @@ fn request_row(
         p.method(req.method)
     };
     ui.painter().text(
-        pos2(rect.left() + 28.0, cy),
+        pos2(rect.left() + indent + 28.0, cy),
         Align2::LEFT_CENTER,
         method_short(req.method),
         font::mono_small(),
@@ -1652,7 +1755,7 @@ fn request_row(
     } else {
         mix(p.text, p.text_muted, 0.45)
     };
-    let x = rect.left() + 68.0;
+    let x = rect.left() + indent + 68.0;
     let right = if busy { 22.0 } else { 8.0 };
     let name = if req.name.is_empty() {
         "Untitled"

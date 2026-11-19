@@ -41,6 +41,9 @@ cargo build --release        # binary at target/release/kolibri
 cargo test                   # unit tests
 ```
 
+On macOS, `scripts/bundle-macos.sh` builds `target/release/Kolibri.app` with the app
+icon, which you can drag to `/Applications`.
+
 Built with [egui/eframe](https://github.com/emilk/egui) (OpenGL via glow) and
 [ureq](https://github.com/algesten/ureq) (blocking HTTP on background threads,
 rustls with the OS certificate store).
@@ -54,3 +57,6 @@ rustls with the OS certificate store).
 - `src/http.rs` building and sending requests, JSON beautify
 - `src/loadtest.rs` load test workers and stats
 - `src/highlight.rs` small JSON syntax highlighter
+- `assets/` app icon: `icon.png` (1024 master), `icon-512.png` (embedded window/Dock icon),
+  `kolibri.icns` (macOS bundle), `icon-source.png` (original artwork)
+- `scripts/bundle-macos.sh` builds the macOS `.app` bundle

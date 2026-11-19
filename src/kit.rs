@@ -37,6 +37,8 @@ pub enum Icon {
     Command,
     /// ↵
     Return,
+    Moon,
+    Sun,
 }
 
 pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -192,6 +194,40 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Return => {
             line(&[(12.6, 3.6), (12.6, 10.0), (3.6, 10.0)]);
             line(&[(6.4, 7.2), (3.6, 10.0), (6.4, 12.8)]);
+        }
+        Icon::Moon => {
+            // Crescent: the part of the big circle outside the small one.
+            let (c1, r1) = (pos2(7.6, 8.4), 5.6);
+            let (c2, r2) = (pos2(10.4, 5.6), 4.4);
+            let on = |c: Pos2, r: f32, a: f32| pos2(c.x + r * a.cos(), c.y + r * a.sin());
+            let n = 72;
+            let step = std::f32::consts::TAU / n as f32;
+            // Start each sweep where the arc is hidden, so the kept points are one run.
+            let a1 = (c2.y - c1.y).atan2(c2.x - c1.x);
+            let outer: Vec<Pos2> = (0..=n)
+                .map(|i| on(c1, r1, a1 + i as f32 * step))
+                .filter(|q| q.distance(c2) > r2)
+                .collect();
+            let a2 = (c2.y - c1.y).atan2(c2.x - c1.x);
+            let mut inner: Vec<Pos2> = (0..=n)
+                .map(|i| on(c2, r2, a2 + i as f32 * step))
+                .filter(|q| q.distance(c1) < r1)
+                .collect();
+            if let (Some(last), Some(first), Some(end)) = (outer.last(), inner.first(), inner.last()) {
+                if last.distance(*first) > last.distance(*end) {
+                    inner.reverse();
+                }
+            }
+            let pts: Vec<Pos2> = outer.into_iter().chain(inner).map(|q| pt(q.x, q.y)).collect();
+            p.add(Shape::closed_line(pts, st));
+        }
+        Icon::Sun => {
+            p.circle_stroke(pt(8.0, 8.0), 2.8 * s, st);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                let (dx, dy) = (a.cos(), a.sin());
+                line(&[(8.0 + 4.6 * dx, 8.0 + 4.6 * dy), (8.0 + 6.2 * dx, 8.0 + 6.2 * dy)]);
+            }
         }
         Icon::Stop => {
             p.rect_stroke(
@@ -856,6 +892,22 @@ pub fn progress(ui: &mut Ui, fraction: f32, color: Color32) {
             Rect::from_min_size(rect.min, vec2((rect.width() * f).max(6.0), rect.height()));
         ui.painter().rect_filled(filled, cr, color);
     }
+}
+
+/// Theme switch as a single icon button. It shows the mode a click switches
+/// to: a sun while dark, a moon while light. `dark` is toggled on click.
+pub fn theme_toggle(ui: &mut Ui, dark: &mut bool) -> Response {
+    let (icon_kind, tip) = if *dark {
+        (Icon::Sun, "Switch to light mode")
+    } else {
+        (Icon::Moon, "Switch to dark mode")
+    };
+    let mut resp = icon_button_sized(ui, icon_kind, tip, size::CONTROL);
+    if resp.clicked() {
+        *dark = !*dark;
+        resp.mark_changed();
+    }
+    resp
 }
 
 // ---------------------------------------------------------------- menus

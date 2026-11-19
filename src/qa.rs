@@ -274,6 +274,8 @@ enum ClickAt {
     FirstRequestRow,
     /// Primary click on the method picker.
     MethodPicker,
+    /// Primary click on the dark mode toggle.
+    ThemeToggle,
 }
 
 fn idle(app: &App) -> bool {
@@ -567,7 +569,20 @@ fn steps() -> Vec<Step> {
             click: None,
         },
         Step {
-            name: "26-empty-collection",
+            // Starts dark; a real click on the toggle must switch to light.
+            name: "26-toggle-clicked-light",
+            size: BIG,
+            light: false,
+            setup: |a, _| {
+                a.resp_tab = RespTab::Body;
+                a.req_tab = ReqTab::Params;
+                select(a, "List users")
+            },
+            ready: |a| a.store.light_mode,
+            click: Some(ClickAt::ThemeToggle),
+        },
+        Step {
+            name: "27-empty-collection",
             size: BIG,
             light: false,
             setup: |a, _| {
@@ -634,13 +649,14 @@ fn click_events(ctx: &egui::Context, at: ClickAt) -> Vec<egui::Event> {
     let key = match at {
         ClickAt::FirstRequestRow => "qa_first_request_row",
         ClickAt::MethodPicker => "qa_method_picker",
+        ClickAt::ThemeToggle => "qa_theme_toggle",
     };
     let rect: Option<Rect> = ctx.data(|d| d.get_temp(Id::unique(key)));
     let Some(rect) = rect else { return Vec::new() };
     let pos = rect.center();
     let button = match at {
         ClickAt::FirstRequestRow => egui::PointerButton::Secondary,
-        ClickAt::MethodPicker => egui::PointerButton::Primary,
+        ClickAt::MethodPicker | ClickAt::ThemeToggle => egui::PointerButton::Primary,
     };
     vec![
         egui::Event::PointerMoved(pos),
@@ -694,11 +710,7 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
                 step.size[0],
                 step.size[1],
             )));
-            ctx.set_theme(if step.light {
-                egui::Theme::Light
-            } else {
-                egui::Theme::Dark
-            });
+            app.store.light_mode = step.light;
             (step.setup)(app, ctx);
             t.phase = Phase::Settle {
                 frames: 0,

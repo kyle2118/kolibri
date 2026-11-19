@@ -72,7 +72,8 @@ rustls with the OS certificate store).
 
 Colors, fonts and sizes live only in `src/theme.rs`; screens use semantic names
 (`bg_surface`, `text_muted`, `accent`, `space::MD`, `size::CONTROL`, ...) and the
-components in `src/kit.rs`. The app follows the system light/dark setting.
+components in `src/kit.rs`. Kolibri starts in dark mode; the sun/moon button above
+Send switches themes, and the choice is saved with your collections.
 
 ## Visual QA
 

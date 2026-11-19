@@ -104,6 +104,9 @@ pub struct App {
     qa: Option<qa::Tour>,
 }
 
+/// Minimum width of the Send button.
+const SEND_W: f32 = 116.0;
+
 /// Platform-appropriate shortcut label, e.g. "⌘↵" on macOS, "Ctrl+↵" elsewhere.
 fn shortcut(key: &str) -> String {
     if cfg!(target_os = "macos") {
@@ -157,6 +160,7 @@ impl App {
         theme::install(&cc.egui_ctx);
         let path = model::data_path();
         let (store, notice) = model::load(&path);
+        cc.egui_ctx.set_theme(if store.light_mode { egui::Theme::Light } else { egui::Theme::Dark });
         #[allow(unused_mut)]
         let mut app = Self::with_store(store, path, notice);
         app.logo = load_logo(&cc.egui_ctx);
@@ -191,6 +195,13 @@ impl App {
             #[cfg(feature = "qa")]
             qa: None,
         }
+    }
+
+    /// Switch between dark and light mode and remember the choice.
+    fn set_dark(&mut self, ctx: &egui::Context, dark: bool) {
+        self.store.light_mode = !dark;
+        ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+        self.touch();
     }
 
     fn touch(&mut self) {
@@ -779,22 +790,33 @@ impl App {
 
         let (fi, _) = self.store.locate_request(id).unwrap();
         let folder_name = self.store.folders[fi].name.clone();
+        let mut dark = !self.store.light_mode;
+        let mut theme_changed = false;
         let req = self.store.find_request_mut(id).unwrap();
 
-        // Breadcrumb header.
+        // Header: breadcrumb on the left, theme icon on the right (above Send).
         ui.horizontal(|ui| {
             ui.set_height(size::CONTROL);
-            ui.spacing_mut().item_spacing.x = 6.0;
-            kit::icon(ui, Icon::Folder, size::ICON, p.text_faint);
-            ui.label(
-                RichText::new(&folder_name)
-                    .font(font::body())
-                    .color(p.text_muted),
-            );
-            kit::icon(ui, Icon::ChevronRight, size::ICON_SM, p.text_faint);
-            ui.add(
-                Label::new(RichText::new(&req.name).font(font::title()).color(p.text)).truncate(),
-            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let toggle = kit::theme_toggle(ui, &mut dark);
+                theme_changed = toggle.changed();
+                #[cfg(feature = "qa")]
+                ui.ctx().data_mut(|d| d.insert_temp(Id::unique("qa_theme_toggle"), toggle.rect));
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    kit::icon(ui, Icon::Folder, size::ICON, p.text_faint);
+                    ui.label(
+                        RichText::new(&folder_name)
+                            .font(font::body())
+                            .color(p.text_muted),
+                    );
+                    kit::icon(ui, Icon::ChevronRight, size::ICON_SM, p.text_faint);
+                    ui.add(
+                        Label::new(RichText::new(&req.name).font(font::title()).color(p.text))
+                            .truncate(),
+                    );
+                });
+            });
         });
         ui.add_space(space::SM);
 
@@ -802,7 +824,7 @@ impl App {
         let url_id = Id::unique("kolibri-url-bar");
         ui.horizontal(|ui| {
             let h = size::CONTROL_LG;
-            let send_w = 116.0;
+            let send_w = SEND_W;
             let w = (ui.available_width() - send_w - space::SM).max(220.0);
             let (bar, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
             let focused = ui.memory(|m| m.has_focus(url_id));
@@ -949,7 +971,7 @@ impl App {
                 let b = kit::Button::secondary("Cancel")
                     .icon(Icon::Stop)
                     .height(h)
-                    .min_width(send_w);
+                    .min_width(ui.available_width().max(send_w));
                 if ui.add(b).clicked() {
                     cancel_send = true;
                 }
@@ -959,7 +981,7 @@ impl App {
                     .icon(Icon::Send)
                     .shortcut(&hint)
                     .height(h)
-                    .min_width(send_w);
+                    .min_width(ui.available_width().max(send_w));
                 if ui
                     .add(b)
                     .on_hover_text(format!("Send request ({hint})"))
@@ -1143,6 +1165,9 @@ impl App {
             }
         });
 
+        if theme_changed {
+            self.set_dark(&ctx, dark);
+        }
         if changed {
             self.touch();
         }
@@ -1185,6 +1210,21 @@ impl App {
     fn no_selection(&mut self, ui: &mut Ui) {
         let first_folder = self.store.folders.first().map(|f| f.id);
         let mut action = None;
+        // Same header position as on the request screen.
+        let mut dark = !self.store.light_mode;
+        let toggled = ui
+            .horizontal(|ui| {
+                ui.set_height(size::CONTROL);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    kit::theme_toggle(ui, &mut dark).changed()
+                })
+                .inner
+            })
+            .inner;
+        if toggled {
+            let ctx = ui.ctx().clone();
+            self.set_dark(&ctx, dark);
+        }
         ui.add_space((ui.available_height() * 0.28).max(space::XL));
         let (title, body) = if first_folder.is_some() {
             (
@@ -1383,6 +1423,10 @@ impl App {
         let ctx = ui.ctx().clone();
         #[cfg(feature = "qa")]
         qa::tick(self, &ctx);
+        let want = if self.store.light_mode { egui::Theme::Light } else { egui::Theme::Dark };
+        if ctx.theme() != want {
+            ctx.set_theme(want);
+        }
         let p = theme::palette(ui);
         self.poll_inflight();
         self.shortcuts(&ctx);
@@ -2302,16 +2346,26 @@ mod tests {
     }
 
     #[test]
+    fn dark_by_default_and_toggle_is_saved() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut app = test_app();
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        app.set_dark(&ctx, false);
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(ctx.theme(), egui::Theme::Light);
+        assert!(app.store.light_mode);
+        assert!(app.dirty, "the choice is written to the data file");
+    }
+
+    #[test]
     fn every_screen_renders_in_both_themes() {
         for dark in [true, false] {
             let ctx = egui::Context::default();
             theme::install(&ctx);
-            ctx.set_theme(if dark {
-                egui::Theme::Dark
-            } else {
-                egui::Theme::Light
-            });
             let mut app = test_app();
+            app.store.light_mode = !dark;
             let id = app.store.selected.unwrap();
             for tab in [ReqTab::Params, ReqTab::Headers, ReqTab::Body] {
                 app.req_tab = tab;

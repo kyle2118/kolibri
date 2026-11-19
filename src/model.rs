@@ -109,6 +109,8 @@ pub struct Store {
     pub version: u32,
     pub next_id: u64,
     pub selected: Option<u64>,
+    /// Light theme instead of the default dark one.
+    pub light_mode: bool,
     pub folders: Vec<Folder>,
 }
 
@@ -307,6 +309,14 @@ mod tests {
         params_from_url(&mut r);
         assert_eq!(r.params.len(), 3);
         assert!(!r.params[2].enabled);
+    }
+
+    #[test]
+    fn dark_mode_is_the_default() {
+        assert!(!Store::starter().light_mode);
+        // Files saved before the setting existed also open in dark mode.
+        let s: Store = serde_json::from_str(r#"{"version":1,"folders":[]}"#).unwrap();
+        assert!(!s.light_mode);
     }
 
     #[test]

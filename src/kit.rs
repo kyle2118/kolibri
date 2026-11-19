@@ -21,6 +21,8 @@ pub enum Icon {
     ChevronDown,
     Folder,
     FolderPlus,
+    /// Tray with a down arrow.
+    Import,
     Send,
     Copy,
     Close,
@@ -84,6 +86,11 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             ]);
             line(&[(8.0, 7.2), (8.0, 11.0)]);
             line(&[(6.1, 9.1), (9.9, 9.1)]);
+        }
+        Icon::Import => {
+            line(&[(2.5, 9.5), (2.5, 13.0), (13.5, 13.0), (13.5, 9.5)]);
+            line(&[(8.0, 2.5), (8.0, 10.0)]);
+            line(&[(5.0, 7.2), (8.0, 10.2), (11.0, 7.2)]);
         }
         Icon::Send => {
             closed(&[(2.5, 7.6), (13.8, 2.6), (9.4, 13.6), (7.6, 9.0)]);

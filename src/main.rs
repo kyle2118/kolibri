@@ -7,6 +7,7 @@ mod http;
 mod kit;
 mod loadtest;
 mod model;
+mod postman;
 mod theme;
 
 /// App icon (window, taskbar and macOS Dock), embedded in the binary.
@@ -14,7 +15,9 @@ const ICON_PNG: &[u8] = include_bytes!("../assets/icon-512.png");
 
 fn main() -> eframe::Result {
     let mut viewport = eframe::egui::ViewportBuilder::default()
+        // The name stays for the Dock / window menus but is not drawn in the title bar.
         .with_title("Kolibri")
+        .with_title_shown(false)
         .with_inner_size([1200.0, 780.0])
         .with_min_inner_size([720.0, 420.0])
         .with_app_id("kolibri");

@@ -3,6 +3,7 @@ use crate::highlight::json_job;
 use crate::http::{self, HttpResult};
 use crate::kit::{self, seg, Icon};
 use crate::loadtest;
+use crate::postman;
 use crate::model::{self, BodyKind, Folder, KeyValue, Method, Request, Store};
 use crate::theme::{self, font, mix, radius, size, space, Palette};
 use eframe::egui::{
@@ -73,6 +74,7 @@ enum Action {
     StartRename(Item),
     NewRequest(u64),
     NewFolder,
+    ImportPostman,
     Duplicate(u64),
     AskDelete(Item),
 }
@@ -197,6 +199,49 @@ impl App {
         }
     }
 
+    /// Ask for a Postman collection file and add its folders and requests.
+    fn import_postman(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import Postman collection")
+            .add_filter("Postman collection", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.notice = Some(format!("Could not read {}: {e}", path.display()));
+                return;
+            }
+        };
+        let result = postman::import(&text, &mut self.store);
+        self.apply_import(result);
+    }
+
+    fn apply_import(&mut self, result: Result<postman::Imported, String>) {
+        match result {
+            Ok(imported) => {
+                let first = imported.folders.first().and_then(|f| f.requests.first()).map(|r| r.id);
+                self.store.folders.extend(imported.folders);
+                if first.is_some() {
+                    self.store.selected = first;
+                }
+                self.notice = match imported.warnings.as_slice() {
+                    [] => None,
+                    [one] => Some(format!("Imported {} requests. {one}", imported.requests)),
+                    [one, rest @ ..] => Some(format!(
+                        "Imported {} requests. {one} (+{} more notes)",
+                        imported.requests,
+                        rest.len()
+                    )),
+                };
+                self.touch();
+            }
+            Err(e) => self.notice = Some(format!("Postman import failed: {e}")),
+        }
+    }
+
     /// Switch between dark and light mode and remember the choice.
     fn set_dark(&mut self, ctx: &egui::Context, dark: bool) {
         self.store.light_mode = !dark;
@@ -307,6 +352,7 @@ impl App {
                 });
                 self.touch();
             }
+            Action::ImportPostman => self.import_postman(),
             Action::NewRequest(fid) => {
                 let Some(fi) = self.store.folder_index(fid) else {
                     return;
@@ -459,6 +505,9 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if kit::icon_button(ui, Icon::FolderPlus, "New folder").clicked() {
                     actions.push(Action::NewFolder);
+                }
+                if kit::icon_button(ui, Icon::Import, "Import Postman collection").clicked() {
+                    actions.push(Action::ImportPostman);
                 }
             });
         });

@@ -162,6 +162,10 @@ pub struct Store {
     /// Light theme instead of the default dark one.
     pub light_mode: bool,
     pub folders: Vec<Folder>,
+    /// Requests not saved in any folder yet. They live only in their tab.
+    pub drafts: Vec<Request>,
+    /// Open editor tabs, in order. `selected` is the active one.
+    pub tabs: Vec<u64>,
 }
 
 impl Store {
@@ -191,7 +195,11 @@ impl Store {
         s
     }
 
+    /// A request in any folder, or a draft.
     pub fn find_request(&self, id: u64) -> Option<&Request> {
+        if let Some(d) = self.drafts.iter().find(|r| r.id == id) {
+            return Some(d);
+        }
         let mut found = None;
         walk(&self.folders, &mut |f| {
             if found.is_none() {
@@ -202,11 +210,34 @@ impl Store {
     }
 
     pub fn find_request_mut(&mut self, id: u64) -> Option<&mut Request> {
+        if let Some(i) = self.drafts.iter().position(|r| r.id == id) {
+            return self.drafts.get_mut(i);
+        }
         let (fid, ri) = self.locate_request(id)?;
         self.folder_mut(fid)?.requests.get_mut(ri)
     }
 
+    pub fn is_draft(&self, id: u64) -> bool {
+        self.drafts.iter().any(|r| r.id == id)
+    }
+
+    /// Move draft `id` to the end of folder `folder`. False if either is missing.
+    pub fn save_draft(&mut self, id: u64, folder: u64) -> bool {
+        let Some(i) = self.drafts.iter().position(|r| r.id == id) else {
+            return false;
+        };
+        if self.folder(folder).is_none() {
+            return false;
+        }
+        let r = self.drafts.remove(i);
+        let f = self.folder_mut(folder).unwrap();
+        f.expanded = true;
+        f.requests.push(r);
+        true
+    }
+
     /// Returns (id of the folder holding the request, request index).
+    /// Drafts are in no folder.
     pub fn locate_request(&self, id: u64) -> Option<(u64, usize)> {
         let mut found = None;
         walk(&self.folders, &mut |f| {
@@ -323,6 +354,19 @@ impl Store {
         hits
     }
 
+    /// Every folder as (id, name, depth), in sidebar order.
+    pub fn folder_list(&self) -> Vec<(u64, String, usize)> {
+        fn visit(folders: &[Folder], depth: usize, out: &mut Vec<(u64, String, usize)>) {
+            for f in folders {
+                out.push((f.id, f.name.clone(), depth));
+                visit(&f.folders, depth + 1, out);
+            }
+        }
+        let mut out = Vec::new();
+        visit(&self.folders, 0, &mut out);
+        out
+    }
+
     /// Collapse every folder at every depth.
     pub fn collapse_all(&mut self) {
         walk_mut(&mut self.folders, &mut |f| f.expanded = false);
@@ -332,7 +376,7 @@ impl Store {
     /// (protects against hand-edited files).
     fn normalize(&mut self) {
         // Pass 1: find the highest id, so fresh ids can't collide with any.
-        let mut max = 0;
+        let mut max = self.drafts.iter().map(|r| r.id).max().unwrap_or(0);
         walk(&self.folders, &mut |f| {
             max = max.max(f.id);
             max = f.requests.iter().map(|r| r.id).fold(max, u64::max);
@@ -350,7 +394,28 @@ impl Store {
             fix(&mut f.id);
             f.requests.iter_mut().for_each(|r| fix(&mut r.id));
         });
+        self.drafts.iter_mut().for_each(|r| fix(&mut r.id));
         self.next_id = next;
+        self.fix_tabs();
+    }
+
+    /// Keep tabs pointing at real requests, without repeats, and make sure
+    /// the selected request has a tab.
+    pub fn fix_tabs(&mut self) {
+        let mut seen = HashSet::new();
+        let tabs = std::mem::take(&mut self.tabs);
+        self.tabs = tabs
+            .into_iter()
+            .filter(|id| seen.insert(*id) && self.find_request(*id).is_some())
+            .collect();
+        match self.selected {
+            Some(id) if self.find_request(id).is_some() => {
+                if !self.tabs.contains(&id) {
+                    self.tabs.push(id);
+                }
+            }
+            _ => self.selected = self.tabs.last().copied(),
+        }
     }
 }
 
@@ -551,6 +616,26 @@ mod tests {
         assert!(h.requests.contains(&4) && h.folders.contains(&3));
 
         assert!(s.search("nothing-like-this").folders.is_empty());
+    }
+
+    #[test]
+    fn drafts_and_tabs() {
+        let mut s = Store::starter();
+        let saved = s.selected.unwrap();
+        let fid = s.folders[0].id;
+        s.drafts.push(Request { id: 99, url: "https://x".into(), ..Default::default() });
+        assert!(s.is_draft(99) && s.find_request(99).is_some());
+        assert_eq!(s.locate_request(99), None);
+
+        // Old files have no tabs: the selected request gets one.
+        s.tabs = vec![99, 99, 12345];
+        s.normalize();
+        assert_eq!(s.tabs, [99, saved]);
+
+        assert!(s.save_draft(99, fid));
+        assert!(!s.is_draft(99));
+        assert_eq!(s.locate_request(99), Some((fid, 1)));
+        assert!(!s.save_draft(99, fid), "already saved");
     }
 
     #[test]

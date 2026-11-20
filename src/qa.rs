@@ -260,7 +260,7 @@ fn request_id(app: &App, name: &str) -> u64 {
 
 fn select(app: &mut App, name: &str) {
     let id = request_id(app, name);
-    app.store.selected = Some(id);
+    app.open_tab(id);
 }
 
 fn select_and_send(app: &mut App, ctx: &egui::Context, name: &str) {
@@ -492,6 +492,7 @@ fn steps() -> Vec<Step> {
             light: false,
             setup: |a, _| {
                 a.rename = None;
+                a.store.tabs.clear();
                 a.store.selected = None
             },
             ready: always,
@@ -599,8 +600,27 @@ fn steps() -> Vec<Step> {
             click: Some(ClickAt::ThemeToggle),
         },
         Step {
+            // Requests from different folders open side by side, plus an unsaved one.
+            name: "27-tabs-and-draft",
+            size: BIG,
+            light: false,
+            setup: |a, _| {
+                for name in ["Get invoice", "Ping", "List users"] {
+                    select(a, name);
+                }
+                a.apply(Action::NewDraft);
+                let id = a.store.selected.unwrap();
+                let d = a.store.find_request_mut(id).unwrap();
+                d.name = "Scratch: search".into();
+                d.url = "https://api.example.com/search?q=kolibri".into();
+                model::params_from_url(d);
+            },
+            ready: always,
+            click: None,
+        },
+        Step {
             // URL match inside a collapsed folder and inside a subfolder.
-            name: "27-search-by-url",
+            name: "28-search-by-url",
             size: BIG,
             light: false,
             setup: |a, _| a.search = "health".into(),
@@ -608,7 +628,7 @@ fn steps() -> Vec<Step> {
             click: None,
         },
         Step {
-            name: "28-search-no-matches",
+            name: "29-search-no-matches",
             size: BIG,
             light: false,
             setup: |a, _| a.search = "zzz".into(),
@@ -616,12 +636,14 @@ fn steps() -> Vec<Step> {
             click: None,
         },
         Step {
-            name: "29-empty-collection",
+            name: "30-empty-collection",
             size: BIG,
             light: false,
             setup: |a, _| {
                 a.search.clear();
                 a.store.folders.clear();
+                a.store.drafts.clear();
+                a.store.tabs.clear();
                 a.store.selected = None
             },
             ready: always,

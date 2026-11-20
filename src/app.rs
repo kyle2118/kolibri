@@ -82,7 +82,15 @@ struct ResponseView {
 }
 
 enum Action {
+    /// Open the request in a tab (or switch to its tab).
     Select(u64),
+    /// New request in no folder, in a new tab.
+    NewDraft,
+    CloseTab(u64),
+    /// Move a draft into a folder: (request, folder).
+    SaveDraft(u64, u64),
+    /// No folders yet: make one and save the draft in it.
+    NewFolderAndSave(u64),
     Toggle(u64),
     StartRename(Item),
     NewRequest(u64),
@@ -111,6 +119,10 @@ pub struct App {
     req_tab: ReqTab,
     resp_tab: RespTab,
     rename: Option<Rename>,
+    /// Put the cursor in the URL bar on the next frame (new drafts).
+    focus_url: bool,
+    /// Put the cursor in the draft name field on the next frame (F2 on a draft).
+    focus_draft_name: bool,
     /// Sidebar search text (not saved).
     search: String,
     drag: Option<Item>,
@@ -206,6 +218,8 @@ impl App {
             req_tab: ReqTab::Params,
             resp_tab: RespTab::Body,
             rename: None,
+            focus_url: false,
+            focus_draft_name: false,
             search: String::new(),
             drag: None,
             confirm_delete: None,
@@ -242,8 +256,8 @@ impl App {
             Ok(imported) => {
                 let first = imported.folder.requests.first().map(|r| r.id);
                 self.store.folders.push(imported.folder);
-                if first.is_some() {
-                    self.store.selected = first;
+                if let Some(id) = first {
+                    self.open_tab(id);
                 }
                 self.notice = match imported.warnings.as_slice() {
                     [] => None,
@@ -328,11 +342,31 @@ impl App {
 
     fn apply(&mut self, a: Action) {
         match a {
-            Action::Select(id) => {
-                self.store.selected = Some(id);
-                self.beautify_err = None;
-                self.curl_err = None;
-                self.touch();
+            Action::Select(id) => self.open_tab(id),
+            Action::NewDraft => {
+                let id = self.store.new_id();
+                self.store.drafts.push(Request {
+                    id,
+                    name: "Untitled request".into(),
+                    ..Default::default()
+                });
+                self.open_tab(id);
+                self.focus_url = true;
+            }
+            Action::CloseTab(id) => self.close_tab(id),
+            Action::NewFolderAndSave(rid) => {
+                let fid = self.store.new_id();
+                self.store.folders.push(Folder {
+                    id: fid,
+                    name: "My requests".into(),
+                    ..Default::default()
+                });
+                self.apply(Action::SaveDraft(rid, fid));
+            }
+            Action::SaveDraft(id, folder) => {
+                if self.store.save_draft(id, folder) {
+                    self.touch();
+                }
             }
             Action::Toggle(fid) => {
                 if let Some(f) = self.store.folder_mut(fid) {
@@ -390,7 +424,7 @@ impl App {
                     name: "New request".into(),
                     ..Default::default()
                 });
-                self.store.selected = Some(id);
+                self.open_tab(id);
                 self.rename = Some(Rename {
                     item: Item::Request(id),
                     text: "New request".into(),
@@ -410,7 +444,7 @@ impl App {
                 copy.id = id;
                 copy.name.push_str(" copy");
                 f.requests.insert(ri + 1, copy);
-                self.store.selected = Some(id);
+                self.open_tab(id);
                 self.touch();
             }
             Action::AskDelete(item) => self.confirm_delete = Some(item),
@@ -443,11 +477,7 @@ impl App {
             Item::Folder(id) => {
                 if let Some((_, _, f)) = self.store.take_folder(id) {
                     for rid in f.request_ids() {
-                        self.responses.remove(&rid);
-                        self.loads.remove(&rid);
-                        if self.store.selected == Some(rid) {
-                            self.store.selected = None;
-                        }
+                        self.forget_request(rid);
                     }
                 }
             }
@@ -456,15 +486,69 @@ impl App {
                     if let Some(f) = self.store.folder_mut(fid) {
                         f.requests.remove(ri);
                     }
-                    self.responses.remove(&id);
-                    self.loads.remove(&id);
-                    if self.store.selected == Some(id) {
-                        self.store.selected = None;
-                    }
+                } else {
+                    self.store.drafts.retain(|r| r.id != id);
                 }
+                self.forget_request(id);
             }
         }
         self.touch();
+    }
+
+    /// Show request `id` in a tab, opening one right after the active tab if needed.
+    fn open_tab(&mut self, id: u64) {
+        if !self.store.tabs.contains(&id) {
+            let at = self
+                .store
+                .selected
+                .and_then(|s| self.store.tabs.iter().position(|t| *t == s))
+                .map_or(self.store.tabs.len(), |i| i + 1);
+            self.store.tabs.insert(at, id);
+        }
+        if self.store.selected != Some(id) {
+            self.beautify_err = None;
+            self.curl_err = None;
+        }
+        self.store.selected = Some(id);
+        self.touch();
+    }
+
+    /// Close a tab. A draft with content asks first, since closing discards it.
+    fn close_tab(&mut self, id: u64) {
+        if let Some(d) = self.store.drafts.iter().find(|r| r.id == id) {
+            let blank = d.url.is_empty()
+                && d.body.is_empty()
+                && d.headers.iter().all(KeyValue::is_blank);
+            if blank {
+                self.store.drafts.retain(|r| r.id != id);
+            } else {
+                self.confirm_delete = Some(Item::Request(id));
+                return;
+            }
+        }
+        self.forget_request(id);
+        self.touch();
+    }
+
+    /// Drop the tab and the in-memory state of a request that was closed or deleted.
+    /// The selection moves to the neighbouring tab.
+    fn forget_request(&mut self, id: u64) {
+        if !self.store.is_draft(id) && self.store.locate_request(id).is_some() {
+            // Still saved in a folder: only the tab closes.
+        } else {
+            self.responses.remove(&id);
+            self.loads.remove(&id);
+            self.inflight.remove(&id);
+        }
+        if let Some(i) = self.store.tabs.iter().position(|t| *t == id) {
+            self.store.tabs.remove(i);
+            if self.store.selected == Some(id) {
+                let next = self.store.tabs.get(i).or(self.store.tabs.get(i.wrapping_sub(1)));
+                self.store.selected = next.copied();
+            }
+        } else if self.store.selected == Some(id) {
+            self.store.selected = None;
+        }
     }
 
     fn apply_drop(&mut self, item: Item, target: DropTarget) {
@@ -667,12 +751,15 @@ impl App {
             TextEdit::singleline(&mut self.search)
                 .id(id)
                 .frame(Frame::NONE)
-                .hint_text(format!("Search name or URL  {}", shortcut("F")))
+                .hint_text("Search name or URL")
                 .font(font::body())
                 .desired_width(f32::INFINITY)
                 .min_size(field.size())
                 .align(Align2::LEFT_CENTER),
         );
+        if !focused {
+            te.clone().on_hover_text(format!("Search requests ({})", shortcut("F")));
+        }
         if (te.has_focus() || te.lost_focus()) && ui.input(|i| i.key_pressed(Key::Escape)) {
             self.search.clear();
         }
@@ -974,9 +1061,52 @@ impl App {
 
     // ------------------------------------------------------------------ main area
 
+    /// Open requests as tabs, plus "+" for a new unsaved request.
+    fn tab_bar(&mut self, ui: &mut Ui) -> Option<Action> {
+        let p = theme::palette(ui);
+        let mut action = None;
+        let top = ui.cursor().top();
+        ScrollArea::horizontal()
+            .id_salt("kolibri-tabs")
+            .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for &id in &self.store.tabs {
+                        let Some(req) = self.store.find_request(id) else {
+                            continue;
+                        };
+                        let active = self.store.selected == Some(id);
+                        let draft = self.store.is_draft(id);
+                        let busy = self.inflight.contains_key(&id);
+                        if let Some(a) = tab(ui, p, req, active, draft, busy) {
+                            action = Some(a);
+                        }
+                    }
+                    ui.add_space(space::XS);
+                    let tip = format!("New request  {}", shortcut("N"));
+                    if kit::icon_button(ui, Icon::Plus, &tip).clicked() {
+                        action = Some(Action::NewDraft);
+                    }
+                });
+            });
+        // Baseline under the tabs.
+        let y = ui.min_rect().bottom().max(top);
+        ui.painter()
+            .hline(ui.max_rect().x_range(), y, Stroke::new(1.0, p.border));
+        action
+    }
+
     fn main_area(&mut self, ui: &mut Ui) {
         let p = theme::palette(ui);
         let ctx = ui.ctx().clone();
+        if !self.store.tabs.is_empty() {
+            if let Some(a) = self.tab_bar(ui) {
+                self.apply(a);
+            }
+            ui.add_space(space::MD);
+        }
         let Some(id) = self
             .store
             .selected
@@ -995,10 +1125,16 @@ impl App {
         let mut changed = false;
         let busy = self.inflight.contains_key(&id);
 
-        let (fid, _) = self.store.locate_request(id).unwrap();
-        let folder_name = self.store.folder_trail(fid).join(" / ");
+        // Drafts: where they can be saved (folder id, name, depth). Otherwise the folder path.
+        let draft_targets = self.store.is_draft(id).then(|| self.store.folder_list());
+        let folder_name = match self.store.locate_request(id) {
+            Some((fid, _)) => self.store.folder_trail(fid).join(" / "),
+            None => "Unsaved".to_owned(),
+        };
         let mut dark = !self.store.light_mode;
         let mut theme_changed = false;
+        let mut header_action = None;
+        let focus_name = std::mem::take(&mut self.focus_draft_name);
         let req = self.store.find_request_mut(id).unwrap();
 
         // Header: breadcrumb on the left, theme icon on the right (above Send).
@@ -1009,19 +1145,66 @@ impl App {
                 theme_changed = toggle.changed();
                 #[cfg(feature = "qa")]
                 ui.ctx().data_mut(|d| d.insert_temp(Id::unique("qa_theme_toggle"), toggle.rect));
+                if let Some(targets) = &draft_targets {
+                    ui.add_space(space::SM);
+                    let save = ui.add(kit::Button::primary("Save").icon(Icon::Check).small());
+                    let save = save.on_hover_text("Save this request into a folder");
+                    egui::Popup::menu(&save).width(240.0).show(|ui| {
+                        if targets.is_empty()
+                            && kit::menu_item(ui, Some(Icon::FolderPlus), "New folder", false)
+                                .clicked()
+                        {
+                            header_action = Some(Action::NewFolderAndSave(id));
+                        }
+                        for (fid, name, depth) in targets {
+                            ui.horizontal(|ui| {
+                                ui.add_space(*depth as f32 * INDENT);
+                                if kit::menu_item(ui, Some(Icon::Folder), name, false).clicked() {
+                                    header_action = Some(Action::SaveDraft(id, *fid));
+                                }
+                            });
+                        }
+                    });
+                }
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    kit::icon(ui, Icon::Folder, size::ICON, p.text_faint);
+                    let draft = draft_targets.is_some();
+                    kit::icon(
+                        ui,
+                        if draft { Icon::Pencil } else { Icon::Folder },
+                        size::ICON,
+                        p.text_faint,
+                    );
                     ui.label(
                         RichText::new(&folder_name)
                             .font(font::body())
                             .color(p.text_muted),
                     );
                     kit::icon(ui, Icon::ChevronRight, size::ICON_SM, p.text_faint);
-                    ui.add(
-                        Label::new(RichText::new(&req.name).font(font::title()).color(p.text))
+                    if draft {
+                        // Drafts aren't in the sidebar, so they're renamed here.
+                        let name = ui.add(
+                            TextEdit::singleline(&mut req.name)
+                                .id(Id::unique("kolibri-draft-name"))
+                                .frame(Frame::NONE)
+                                .hint_text("Request name")
+                                .font(font::title())
+                                .align(Align2::LEFT_CENTER)
+                                .min_size(vec2(0.0, size::CONTROL))
+                                .desired_width(ui.available_width()),
+                        );
+                        if focus_name {
+                            name.request_focus();
+                        }
+                        changed |= name.changed();
+                    } else {
+                        ui.add(
+                            Label::new(
+                                RichText::new(&req.name).font(font::title()).color(p.text),
+                            )
                             .truncate(),
-                    );
+                        );
+                    }
                 });
             });
         });
@@ -1165,6 +1348,9 @@ impl App {
                     .min_size(trect.size())
                     .align(Align2::LEFT_CENTER),
             );
+            if std::mem::take(&mut self.focus_url) {
+                url.request_focus();
+            }
             if url.changed() {
                 model::params_from_url(req);
                 self.curl_err = None;
@@ -1378,6 +1564,9 @@ impl App {
         if changed {
             self.touch();
         }
+        if let Some(a) = header_action {
+            self.apply(a);
+        }
         if cancel_send {
             self.inflight.remove(&id);
         }
@@ -1435,29 +1624,27 @@ impl App {
         ui.add_space((ui.available_height() * 0.28).max(space::XL));
         let (title, body) = if first_folder.is_some() {
             (
-                "No request selected",
-                "Pick a request in the sidebar, or create a new one.",
+                "No request open",
+                "Open a request from the sidebar, or start a new one.",
             )
         } else {
             (
                 "Welcome to Kolibri",
-                "Create a folder to start collecting requests.",
+                "Start a new request, or create a folder to collect them.",
             )
         };
         kit::empty_state(ui, Icon::Send, title, body, &[]);
         ui.add_space(space::LG);
         ui.vertical_centered(|ui| {
             // Center the button row by measuring it.
-            let w = if first_folder.is_some() { 260.0 } else { 120.0 };
-            ui.allocate_ui(vec2(w, size::CONTROL), |ui| {
+            ui.allocate_ui(vec2(260.0, size::CONTROL), |ui| {
                 ui.horizontal(|ui| {
-                    if let Some(fid) = first_folder {
-                        if ui
-                            .add(kit::Button::primary("New request").icon(Icon::Plus))
-                            .clicked()
-                        {
-                            action = Some(Action::NewRequest(fid));
-                        }
+                    if ui
+                        .add(kit::Button::primary("New request").icon(Icon::Plus))
+                        .on_hover_text(shortcut("N"))
+                        .clicked()
+                    {
+                        action = Some(Action::NewDraft);
                     }
                     if ui
                         .add(kit::Button::secondary("New folder").icon(Icon::FolderPlus))
@@ -1510,6 +1697,10 @@ impl App {
                 }
             },
             Item::Request(id) => match self.store.find_request(id) {
+                Some(r) if self.store.is_draft(id) => (
+                    format!("Discard unsaved request “{}”?", r.name),
+                    "It isn't saved in any folder. This can't be undone.".to_owned(),
+                ),
                 Some(r) => (
                     format!("Delete request “{}”?", r.name),
                     "This can't be undone.".to_owned(),
@@ -1600,13 +1791,29 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let no_focus = ctx.memory(|m| m.focused().is_none());
-        if !no_focus || self.rename.is_some() || self.confirm_delete.is_some() {
+        if self.rename.is_some() || self.confirm_delete.is_some() {
+            return;
+        }
+        // Tabs work even while typing.
+        let cmd = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
+        let (new, close) =
+            ctx.input_mut(|i| (i.consume_shortcut(&cmd(Key::N)), i.consume_shortcut(&cmd(Key::W))));
+        if new {
+            self.apply(Action::NewDraft);
+        }
+        if close {
+            if let Some(id) = self.store.selected {
+                self.apply(Action::CloseTab(id));
+            }
+        }
+        if ctx.memory(|m| m.focused().is_some()) {
             return;
         }
         let (f2, del) = ctx.input(|i| (i.key_pressed(Key::F2), i.key_pressed(Key::Delete)));
         if let Some(id) = self.store.selected {
-            if f2 {
+            if f2 && self.store.is_draft(id) {
+                self.focus_draft_name = true;
+            } else if f2 {
                 self.apply(Action::StartRename(Item::Request(id)));
             }
             if del {
@@ -1644,6 +1851,7 @@ impl App {
             ctx.set_theme(want);
         }
         let p = theme::palette(ui);
+        self.store.fix_tabs();
         self.poll_inflight();
         self.shortcuts(&ctx);
 
@@ -1866,6 +2074,97 @@ fn request_row(
             .circle_filled(pos2(rect.right() - 11.0, cy), 3.5, p.accent);
     }
     resp
+}
+
+/// One editor tab: method, name, and a close button (a dot for unsaved
+/// requests until hovered). Click selects, middle-click or × closes.
+fn tab(
+    ui: &mut Ui,
+    p: &Palette,
+    req: &Request,
+    active: bool,
+    draft: bool,
+    busy: bool,
+) -> Option<Action> {
+    const H: f32 = 32.0;
+    const PAD: f32 = 10.0;
+    const METHOD_W: f32 = 38.0;
+    const CLOSE_W: f32 = 18.0;
+    let name = if req.name.is_empty() { "Untitled" } else { &req.name };
+    let text_w = kit::galley(ui, name, font::body(), p.text).size().x.min(160.0);
+    let w = PAD + METHOD_W + text_w + 8.0 + CLOSE_W + PAD - 4.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, H), Sense::click());
+    let hovered = resp.hovered();
+    let cr = CornerRadius { nw: radius::MD, ne: radius::MD, sw: 0, se: 0 };
+    if active {
+        ui.painter().rect(rect, cr, p.bg_surface, Stroke::new(1.0, p.border), StrokeKind::Inside);
+        // Accent along the top, and no line between the tab and the editor.
+        ui.painter().hline(
+            rect.x_range().shrink(1.0),
+            rect.top() + 1.0,
+            Stroke::new(2.0, p.accent),
+        );
+        ui.painter().hline(
+            rect.x_range().shrink(1.0),
+            rect.bottom(),
+            Stroke::new(2.0, p.bg_surface),
+        );
+    } else if hovered {
+        ui.painter().rect_filled(rect, cr, p.bg_hover);
+    }
+    let cy = rect.center().y;
+    let x = rect.left() + PAD;
+    ui.painter().text(
+        pos2(x, cy),
+        Align2::LEFT_CENTER,
+        method_short(req.method),
+        font::mono_small(),
+        p.method(req.method),
+    );
+    let tc = if active { p.text } else { p.text_muted };
+    kit::paint_text_clipped(
+        ui,
+        pos2(x + METHOD_W, cy),
+        Align2::LEFT_CENTER,
+        name,
+        font::body(),
+        tc,
+        text_w,
+    );
+    let close = Rect::from_center_size(
+        pos2(rect.right() - PAD + 4.0 - CLOSE_W / 2.0, cy),
+        vec2(CLOSE_W, CLOSE_W),
+    );
+    let on_close = resp.hover_pos().is_some_and(|h| close.contains(h));
+    if hovered || (active && !draft && !busy) {
+        if on_close {
+            ui.painter()
+                .rect_filled(close, CornerRadius::same(radius::SM), p.bg_active);
+        }
+        kit::paint_icon(
+            ui.painter(),
+            Rect::from_center_size(close.center(), vec2(10.0, 10.0)),
+            Icon::Close,
+            if on_close { p.text } else { p.text_faint },
+        );
+    } else if busy || draft {
+        // Sending: accent dot. Unsaved: muted dot.
+        let c = if busy { p.accent } else { p.text_muted };
+        ui.painter().circle_filled(close.center(), 3.5, c);
+    }
+    let tip = if draft { "Not saved in a folder yet" } else { "" };
+    let resp = if draft && hovered && !on_close {
+        resp.on_hover_text(tip)
+    } else {
+        resp
+    };
+    if resp.middle_clicked() || (resp.clicked() && on_close) {
+        Some(Action::CloseTab(req.id))
+    } else if resp.clicked() {
+        Some(Action::Select(req.id))
+    } else {
+        None
+    }
 }
 
 /// Returns (rect, commit, cancel).
@@ -2585,6 +2884,67 @@ mod tests {
         assert_eq!(req.method, Method::POST);
         assert_eq!(req.body, "{\"sortBy\":\"default\"}");
         assert_eq!(req.headers.len(), 3);
+    }
+
+    #[test]
+    fn tabs_open_close_and_drafts() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut app = test_app();
+        frame(&ctx, &mut app, vec![]);
+        let saved = app.store.selected.unwrap();
+        assert_eq!(app.store.tabs, [saved], "the selected request gets a tab");
+
+        // A new draft is in no folder and opens next to the active tab.
+        app.apply(Action::NewDraft);
+        let draft = app.store.selected.unwrap();
+        assert!(app.store.is_draft(draft));
+        assert_eq!(app.store.tabs, [saved, draft]);
+        frame(&ctx, &mut app, vec![]);
+
+        // Re-selecting an open request just switches to it.
+        app.apply(Action::Select(saved));
+        assert_eq!(app.store.tabs, [saved, draft]);
+
+        // Closing a blank draft discards it without asking.
+        app.apply(Action::CloseTab(draft));
+        assert!(app.store.find_request(draft).is_none());
+        assert_eq!(app.store.tabs, [saved]);
+
+        // A draft with content asks first; saving it moves it into a folder.
+        app.apply(Action::NewDraft);
+        let draft = app.store.selected.unwrap();
+        app.store.find_request_mut(draft).unwrap().url = "https://x.test".into();
+        app.apply(Action::CloseTab(draft));
+        assert_eq!(app.confirm_delete, Some(Item::Request(draft)));
+        app.confirm_delete = None;
+        let fid = app.store.folders[0].id;
+        app.apply(Action::SaveDraft(draft, fid));
+        assert_eq!(app.store.locate_request(draft), Some((fid, 1)));
+
+        // Closing a saved request keeps it; the next tab becomes active.
+        app.apply(Action::Select(saved));
+        app.apply(Action::CloseTab(saved));
+        assert!(app.store.find_request(saved).is_some());
+        assert_eq!(app.store.tabs, [draft]);
+        assert_eq!(app.store.selected, Some(draft));
+
+        // Deleting a request closes its tab.
+        app.delete(Item::Request(draft));
+        assert!(app.store.tabs.is_empty());
+        assert_eq!(app.store.selected, None);
+        frame(&ctx, &mut app, vec![]);
+    }
+
+    #[test]
+    fn draft_can_be_saved_when_there_are_no_folders() {
+        let mut app = test_app();
+        app.store.folders.clear();
+        app.apply(Action::NewDraft);
+        let id = app.store.selected.unwrap();
+        app.apply(Action::NewFolderAndSave(id));
+        assert!(!app.store.is_draft(id));
+        assert_eq!(app.store.folders.len(), 1);
     }
 
     #[test]

@@ -367,6 +367,22 @@ impl Store {
         out
     }
 
+    /// Open every folder on the way to request `id` (so its row is visible).
+    /// Returns true if any folder had to be opened.
+    pub fn expand_to_request(&mut self, id: u64) -> bool {
+        let Some(path) = self.locate_request(id).and_then(|(fid, _)| self.folder_path(fid)) else {
+            return false;
+        };
+        let mut changed = false;
+        for n in 1..=path.len() {
+            if let Some(f) = self.folder_at_mut(&path[..n]) {
+                changed |= !f.expanded;
+                f.expanded = true;
+            }
+        }
+        changed
+    }
+
     /// Collapse every folder at every depth.
     pub fn collapse_all(&mut self) {
         walk_mut(&mut self.folders, &mut |f| f.expanded = false);
@@ -636,6 +652,27 @@ mod tests {
         assert!(!s.is_draft(99));
         assert_eq!(s.locate_request(99), Some((fid, 1)));
         assert!(!s.save_draft(99, fid), "already saved");
+    }
+
+    #[test]
+    fn expand_to_request_opens_every_parent() {
+        let mut s = Store::default();
+        s.folders.push(Folder {
+            id: 1,
+            folders: vec![Folder {
+                id: 2,
+                requests: vec![Request { id: 3, ..Default::default() }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        s.folders.push(Folder { id: 4, ..Default::default() });
+        s.collapse_all();
+        assert!(s.expand_to_request(3));
+        assert!(s.folder(1).unwrap().expanded && s.folder(2).unwrap().expanded);
+        assert!(!s.folder(4).unwrap().expanded, "unrelated folders stay closed");
+        assert!(!s.expand_to_request(3), "nothing left to open");
+        assert!(!s.expand_to_request(99));
     }
 
     #[test]

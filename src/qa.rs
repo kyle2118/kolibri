@@ -619,8 +619,29 @@ fn steps() -> Vec<Step> {
             click: None,
         },
         Step {
+            // After "collapse all", switching to a tab reopens just the path to its request.
+            name: "28-tab-reveals-request",
+            size: BIG,
+            light: false,
+            setup: |a, _| {
+                a.apply(Action::CollapseAll);
+                let id = a
+                    .store
+                    .folders
+                    .iter()
+                    .flat_map(|f| &f.folders)
+                    .flat_map(|f| &f.requests)
+                    .find(|r| r.name == "Replay webhook")
+                    .map(|r| r.id)
+                    .unwrap();
+                a.apply(Action::Select(id));
+            },
+            ready: always,
+            click: None,
+        },
+        Step {
             // URL match inside a collapsed folder and inside a subfolder.
-            name: "28-search-by-url",
+            name: "29-search-by-url",
             size: BIG,
             light: false,
             setup: |a, _| a.search = "health".into(),
@@ -628,7 +649,7 @@ fn steps() -> Vec<Step> {
             click: None,
         },
         Step {
-            name: "29-search-no-matches",
+            name: "30-search-no-matches",
             size: BIG,
             light: false,
             setup: |a, _| a.search = "zzz".into(),
@@ -636,7 +657,7 @@ fn steps() -> Vec<Step> {
             click: None,
         },
         Step {
-            name: "30-empty-collection",
+            name: "31-empty-collection",
             size: BIG,
             light: false,
             setup: |a, _| {

@@ -62,8 +62,9 @@ rustls with the OS certificate store).
 - `src/loadtest.rs` load test workers and stats
 - `src/highlight.rs` small JSON syntax highlighter
 - `src/qa.rs` visual QA tour (development only, see below)
-- `assets/` app icon: `icon.png` (1024 master), `icon-512.png` (embedded window/Dock icon),
-  `icon-64.png` (sidebar logo), `kolibri.icns` (macOS bundle), `icon-source.png` (original artwork)
+- `assets/` app icon: `new-logo.png` (transparent bird artwork). Generated from it by
+  `scripts/make-icons.py`: `kolibri.icns` (macOS bundle: the bird on a light rounded square),
+  `icon-512.png` (same icon, embedded for the window/Dock), `icon-64.png` (sidebar logo, bird only)
 - `assets/fonts/` Inter and JetBrains Mono (Latin, Latin Extended, Cyrillic), both under the
   SIL Open Font License (`Inter-OFL.txt`, `JetBrainsMono-OFL.txt`)
 - `scripts/bundle-macos.sh` builds the macOS `.app` bundle

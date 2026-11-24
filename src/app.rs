@@ -64,6 +64,8 @@ const INDENT: f32 = 14.0;
 /// What the sidebar tree collects while drawing.
 #[derive(Default)]
 struct TreeOut {
+    /// Scroll this request's row into view.
+    reveal: Option<u64>,
     rows: Vec<(Rect, RowRef)>,
     actions: Vec<Action>,
     commit: bool,
@@ -123,6 +125,8 @@ pub struct App {
     focus_url: bool,
     /// Put the cursor in the draft name field on the next frame (F2 on a draft).
     focus_draft_name: bool,
+    /// Request whose sidebar row should be scrolled into view next frame.
+    reveal: Option<u64>,
     /// Sidebar search text (not saved).
     search: String,
     drag: Option<Item>,
@@ -195,6 +199,8 @@ impl App {
         #[allow(unused_mut)]
         let mut app = Self::with_store(store, path, notice);
         app.logo = load_logo(&cc.egui_ctx);
+        // Scroll the sidebar to the request that was open last time.
+        app.reveal = app.store.selected;
         #[cfg(feature = "qa")]
         {
             app.qa = qa::Tour::from_env(&mut app);
@@ -220,6 +226,7 @@ impl App {
             rename: None,
             focus_url: false,
             focus_draft_name: false,
+            reveal: None,
             search: String::new(),
             drag: None,
             confirm_delete: None,
@@ -365,6 +372,7 @@ impl App {
             }
             Action::SaveDraft(id, folder) => {
                 if self.store.save_draft(id, folder) {
+                    self.reveal(id);
                     self.touch();
                 }
             }
@@ -510,7 +518,16 @@ impl App {
             self.curl_err = None;
         }
         self.store.selected = Some(id);
+        self.reveal(id);
         self.touch();
+    }
+
+    /// Show request `id` in the sidebar: open its folders and scroll to its row.
+    fn reveal(&mut self, id: u64) {
+        if self.store.expand_to_request(id) {
+            self.touch();
+        }
+        self.reveal = Some(id);
     }
 
     /// Close a tab. A draft with content asks first, since closing discards it.
@@ -545,6 +562,9 @@ impl App {
             if self.store.selected == Some(id) {
                 let next = self.store.tabs.get(i).or(self.store.tabs.get(i.wrapping_sub(1)));
                 self.store.selected = next.copied();
+                if let Some(next) = self.store.selected {
+                    self.reveal(next);
+                }
             }
         } else if self.store.selected == Some(id) {
             self.store.selected = None;
@@ -664,6 +684,7 @@ impl App {
         }
 
         let hits = (!self.search.trim().is_empty()).then(|| self.store.search(&self.search));
+        out.reveal = self.reveal.take();
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -897,6 +918,10 @@ impl App {
                 self.drag == Some(Item::Request(rid)),
             );
             out.rows.push((resp.rect, row));
+            if out.reveal == Some(rid) {
+                resp.scroll_to_me(None);
+                out.reveal = None;
+            }
             #[cfg(feature = "qa")]
             if path.as_slice() == [0] && ri == 0 {
                 ui.ctx().data_mut(|d| {
@@ -2934,6 +2959,43 @@ mod tests {
         assert!(app.store.tabs.is_empty());
         assert_eq!(app.store.selected, None);
         frame(&ctx, &mut app, vec![]);
+    }
+
+    #[test]
+    fn switching_tabs_reveals_the_request_in_the_sidebar() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut app = test_app();
+        // A second request inside a subfolder.
+        let (sub, rid) = (app.store.new_id(), app.store.new_id());
+        app.store.folders[0].folders.push(Folder {
+            id: sub,
+            requests: vec![Request { id: rid, ..Default::default() }],
+            ..Default::default()
+        });
+        let first = app.store.selected.unwrap();
+        app.apply(Action::Select(rid));
+        frame(&ctx, &mut app, vec![]);
+
+        // Collapse all closes everything, including the active request's folders.
+        app.apply(Action::CollapseAll);
+        assert!(!app.store.folders[0].expanded);
+
+        // Switching tab opens the path to that request and selects it.
+        app.apply(Action::Select(first));
+        assert!(app.store.folders[0].expanded);
+        assert!(!app.store.folder(sub).unwrap().expanded, "only the needed folders open");
+        assert_eq!(app.store.selected, Some(first));
+        app.apply(Action::Select(rid));
+        assert!(app.store.folder(sub).unwrap().expanded);
+        assert_eq!(app.reveal, Some(rid));
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.reveal, None, "the sidebar scrolled to it");
+
+        // Clicking the already-active tab after collapsing reopens it too.
+        app.apply(Action::CollapseAll);
+        app.apply(Action::Select(rid));
+        assert!(app.store.folder(sub).unwrap().expanded);
     }
 
     #[test]
